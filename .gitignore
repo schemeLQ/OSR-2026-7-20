@@ -1,0 +1,47 @@
+﻿# images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.svg
+*.tif
+*.tiff
+
+# data and model files
+*.npy
+*.npz
+*.mat
+*.csv
+*.xlsx
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.zip
+*.rar
+*.7z
+
+# folders
+data/
+dataset/
+datasets/
+runs/
+outputs/
+results/
+checkpoints/
+debug_imgs/
+__pycache__/
+.venv/
+venv/
+env/
+
+# python cache
+*.pyc
+
+# local environment and logs
+medaf_cuda13_env/
+logs/
+*.log
+
