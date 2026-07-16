@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
@@ -20,10 +21,15 @@ class ActiveDataHandler(Dataset):
         x, y = self.data[index], self.targets[index]
 
         # 兼容 CIFAR10 (H,W,C) 和 SVHN (C,H,W) 的 numpy 格式
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+
         if isinstance(x, np.ndarray):
             # 如果发现通道数跑到最前面去了 (SVHN格式)，就把它翻转回 (H,W,C)
             if x.ndim == 3 and x.shape[0] == 3:
                 x = np.transpose(x, (1, 2, 0))
+            if x.dtype != np.uint8:
+                x = np.clip(x, 0, 255).astype(np.uint8)
             x = Image.fromarray(x)
 
         if self.transform:
@@ -70,9 +76,9 @@ class ActiveDataset:
 
     def get_subset_by_idxs(self, idxs):
         """获取指定索引的数据子集 (用于 Strategy 计算分数)"""
-        # 查询阶段只做基础归一化，不做强增强
+        # 查询阶段只做基础归一化；Strategy 会按数据集覆盖 transform。
         base_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+            transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25))
         ])
         return ActiveDataHandler(self.data[idxs], self.targets[idxs], base_transform, idxs)

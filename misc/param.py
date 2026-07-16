@@ -21,9 +21,7 @@ def _merge_a_into_b(a, b):
         if type(v) is edict:
             _merge_a_into_b(a[k], b)
         else:
-            if k in str(b.items()):
-                continue
-            else:
+            if k not in b:
                 b[k] = v
 
 
@@ -43,7 +41,7 @@ def get_config(task):
         filename = os.environ['POSE_PARAM_PATH'] + '/misc/' + task + '.yml'
     else:
         filename = 'misc/' + task + '.yml'
-    with open(filename, 'r') as f:
+    with open(filename, 'r', encoding='utf-8') as f:
         yaml_cfg = edict(yaml.safe_load(f))
     _merge_a_into_b(yaml_cfg, option)
 

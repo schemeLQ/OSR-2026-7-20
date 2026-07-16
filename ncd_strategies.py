@@ -1,13 +1,10 @@
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-import numpy as np
+﻿import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from scipy import stats
+from sklearn.metrics import pairwise_distances
 # ==========================================
 # 1. 策略基类 (保持不变)
 # ==========================================
@@ -19,9 +16,11 @@ class Strategy:
         self.device = device
 
     def _get_clean_loader(self, idxs):
+        mean = tuple(getattr(self.args, 'ncd_mean', (0.4914, 0.4822, 0.4465)))
+        std = tuple(getattr(self.args, 'ncd_std', (0.2023, 0.1994, 0.2010)))
         eval_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+            transforms.Normalize(mean, std)
         ])
         temp_dataset = self.dataset.get_subset_by_idxs(idxs)
         if hasattr(temp_dataset, 'transform'):
@@ -83,7 +82,7 @@ class RandomSampling(Strategy):
 class NovelSamplingRandom(Strategy):
     """从预测为新类的样本中随机采样"""
 
-    def query(self, n, current_round=None):
+    def query(self, n, current_round=None, adaptive_round=None, **kwargs):
         num_known = self.args.num_known
         unlabeled_idxs = np.where(~self.dataset.labeled_mask)[0]
         logits = self.get_logits(unlabeled_idxs)
@@ -100,7 +99,7 @@ class NovelSamplingRandom(Strategy):
 class NovelEntropySampling(Strategy):
     """新类簇内熵采样"""
 
-    def query(self, n, current_round=None):
+    def query(self, n, current_round=None, adaptive_round=None, **kwargs):
         num_known = self.args.num_known
         num_unknown = self.args.num_unknown_est
         num_per_class = int(n / num_unknown) if num_unknown > 0 else n
@@ -134,7 +133,7 @@ class MarginSampling(Strategy):
     """
     边际采样：挑选预测概率最大的前两名之间差距 $p_1 - p_2$ 最小的样本。
     """
-    def query(self, n, current_round=None):
+    def query(self, n, current_round=None, adaptive_round=None, **kwargs):
         unlabeled_idxs = np.where(~self.dataset.labeled_mask)[0]
         logits = self.get_logits(unlabeled_idxs)
         probs = F.softmax(logits, dim=1)
@@ -147,7 +146,7 @@ class MarginSampling(Strategy):
 class NovelMarginSampling(Strategy):
     """新类簇内 Margin 采样"""
 
-    def query(self, n, current_round=None):
+    def query(self, n, current_round=None, adaptive_round=None, **kwargs):
         num_known = self.args.num_known
         num_unknown = self.args.num_unknown_est
         num_per_class = int(n / num_unknown) if num_unknown > 0 else n
@@ -179,12 +178,52 @@ class NovelMarginSampling(Strategy):
         return final_idxs[:n]
 
 
+class NovelMarginSamplingAdaptive(NovelMarginSampling):
+    """Early rounds prefer stable samples; later rounds query boundaries."""
+
+    def query(self, n, current_round=0, adaptive_round=2, **kwargs):
+        num_known = self.args.num_known
+        num_unknown = self.args.num_unknown_est
+        num_per_class = max(1, int(n / num_unknown)) if num_unknown > 0 else n
+
+        unlabeled_idxs = np.where(~self.dataset.labeled_mask)[0]
+        n = min(n, len(unlabeled_idxs))
+        if n == 0:
+            return np.array([], dtype=int)
+
+        logits = self.get_logits(unlabeled_idxs)
+        probs = F.softmax(logits, dim=1)
+        preds = logits.argmax(dim=1)
+        probs_sorted, _ = probs.sort(descending=True, dim=1)
+        margins = probs_sorted[:, 0] - probs_sorted[:, 1]
+
+        # Stable pseudo-novel samples bootstrap early rounds. Once queried
+        # labels exist, small-margin samples refine cluster boundaries.
+        descending = current_round < adaptive_round
+        order = margins.sort(descending=descending)[1]
+        sorted_pool = unlabeled_idxs[order.numpy()]
+        sorted_preds = preds[order]
+
+        selected = []
+        for class_id in range(num_known, num_known + num_unknown):
+            class_pool = sorted_pool[sorted_preds == class_id]
+            selected.append(class_pool[:min(len(class_pool), num_per_class)])
+
+        final_idxs = (
+            np.concatenate(selected) if selected else np.array([], dtype=int)
+        )
+        if len(final_idxs) < n:
+            remaining = np.setdiff1d(sorted_pool, final_idxs, assume_unique=False)
+            final_idxs = np.concatenate([final_idxs, remaining[:n - len(final_idxs)]])
+        return final_idxs[:n]
+
+
 class BadgeSampling(Strategy):
     """
     BADGE: 通过梯度空间中的 KMeans++ 同时确保样本的“不确定性”和“多样性”。
     """
 
-    def query(self, n, current_round=None):
+    def query(self, n, current_round=None, adaptive_round=None, **kwargs):
         unlabeled_idxs = np.where(~self.dataset.labeled_mask)[0]
 
         # 1. 计算梯度嵌入 (Gradient Embeddings)
@@ -301,11 +340,154 @@ class ExpertDisagreementAdaptiveSampling(Strategy):
         return final_idxs[:n]
 
 
+class BoundaryMarginJSSampling(Strategy):
+    """Stage-wise stable-boundary expert querying.
+
+    Early AGCD rounds need reliable pseudo-novel anchors to form class centers;
+    later rounds need boundary samples to repair fine-grained class separation.
+    The stable/boundary ratio is therefore selected from current round metrics
+    instead of staying fixed at 70/30.
+    """
+
+    @staticmethod
+    def _norm01(x):
+        x_min, x_max = x.min(), x.max()
+        return (x - x_min) / (x_max - x_min + 1e-8)
+
+    def _stage_stable_ratio(self, current_round=0, udr=None, ca=None):
+        mode = str(getattr(self.args, 'query_stage_mode', 'metric')).lower()
+        fixed_ratio = float(getattr(self.args, 'query_stable_ratio', 0.7))
+        early_ratio = float(getattr(self.args, 'query_early_stable_ratio', 0.85))
+        mid_ratio = float(getattr(self.args, 'query_mid_stable_ratio', 0.55))
+        late_ratio = float(getattr(self.args, 'query_late_stable_ratio', 0.25))
+        udr_thr = float(getattr(self.args, 'query_udr_threshold', 97.0))
+        ca_thr = float(getattr(self.args, 'query_ca_threshold', 85.0))
+
+        if mode == 'fixed':
+            ratio, stage = fixed_ratio, 'fixed'
+        elif mode == 'round':
+            if current_round <= 0:
+                ratio, stage = early_ratio, 'early-anchor'
+            elif current_round < int(getattr(self.args, 'query_boundary_start_round', 2)):
+                ratio, stage = mid_ratio, 'mixed'
+            else:
+                ratio, stage = late_ratio, 'boundary-refine'
+        else:
+            if current_round <= 0:
+                ratio, stage = early_ratio, 'early-anchor'
+            elif udr is not None and float(udr) < udr_thr:
+                ratio, stage = early_ratio, 'discovery-anchor'
+            elif ca is not None and float(ca) < ca_thr:
+                ratio, stage = mid_ratio, 'structure-mixed'
+            else:
+                ratio, stage = late_ratio, 'boundary-refine'
+
+        ratio = min(max(float(ratio), 0.0), 1.0)
+        return ratio, stage
+
+    @staticmethod
+    def _split_counts(n_select, stable_ratio):
+        if n_select <= 0:
+            return 0, 0
+        n_stable = int(round(n_select * stable_ratio))
+        if stable_ratio >= 0.5:
+            n_stable = max(1, n_stable)
+        elif stable_ratio <= 0.0:
+            n_stable = 0
+        n_stable = min(max(n_stable, 0), n_select)
+        return n_stable, n_select - n_stable
+
+    def query(self, n, current_round=0, adaptive_round=2, **kwargs):
+        unlabeled_idxs = np.where(~self.dataset.labeled_mask)[0]
+        n = min(n, len(unlabeled_idxs))
+        if n == 0:
+            return np.array([], dtype=int)
+
+        expert_logits = self.get_expert_logits(unlabeled_idxs)  # [N, 3, C]
+        expert_probs = F.softmax(expert_logits, dim=-1)
+        mean_probs = expert_probs.mean(dim=1)
+        preds = mean_probs.argmax(dim=1)
+
+        eps = 1e-8
+        js = (expert_probs * (
+            expert_probs.clamp(min=eps) / mean_probs.unsqueeze(1).clamp(min=eps)
+        ).log()).sum(dim=2).mean(dim=1)
+
+        probs_sorted, _ = mean_probs.sort(descending=True, dim=1)
+        margin = probs_sorted[:, 0] - probs_sorted[:, 1]
+        margin_uncertainty = 1.0 - self._norm01(margin)
+        js_score = self._norm01(js)
+
+        js_w = float(getattr(self.args, 'query_js_weight', 0.6))
+        margin_w = float(getattr(self.args, 'query_margin_weight', 0.4))
+        boundary_score = js_w * js_score + margin_w * margin_uncertainty
+        stable_score = js_w * (1.0 - js_score) + margin_w * self._norm01(margin)
+        stable_ratio, stage = self._stage_stable_ratio(
+            current_round=current_round,
+            udr=kwargs.get('udr', None),
+            ca=kwargs.get('ca', None),
+        )
+        print(
+            f"   [Stage-wise Query] stage={stage} stable_ratio={stable_ratio:.2f} "
+            f"boundary_ratio={1.0 - stable_ratio:.2f} "
+            f"UDR={kwargs.get('udr', None)} CA={kwargs.get('ca', None)}"
+        )
+
+        num_known = self.args.num_known
+        novel_clusters = np.unique(preds[preds >= num_known].numpy())
+        if len(novel_clusters) == 0:
+            n_stable, _ = self._split_counts(n, stable_ratio)
+            stable_order = stable_score.sort(descending=True)[1].numpy()
+            boundary_order = boundary_score.sort(descending=True)[1].numpy()
+            chosen = list(unlabeled_idxs[stable_order[:n_stable]])
+            for idx in unlabeled_idxs[boundary_order]:
+                if idx not in chosen:
+                    chosen.append(idx)
+                if len(chosen) >= n:
+                    break
+            return np.array(chosen[:n], dtype=int)
+
+        num_per_class = max(1, int(np.ceil(n / len(novel_clusters))))
+        selected = []
+        for cluster_id in novel_clusters:
+            mask = preds == cluster_id
+            idx_in_cluster = unlabeled_idxs[mask.numpy()]
+            stable_in_cluster = stable_score[mask]
+            boundary_in_cluster = boundary_score[mask]
+
+            n_select = min(len(idx_in_cluster), num_per_class)
+            n_stable, _ = self._split_counts(n_select, stable_ratio)
+
+            stable_order = stable_in_cluster.sort(descending=True)[1].numpy()
+            boundary_order = boundary_in_cluster.sort(descending=True)[1].numpy()
+
+            cluster_selected = list(idx_in_cluster[stable_order[:n_stable]])
+            for idx in idx_in_cluster[boundary_order]:
+                if idx not in cluster_selected:
+                    cluster_selected.append(idx)
+                if len(cluster_selected) >= n_select:
+                    break
+            selected.append(np.array(cluster_selected[:n_select], dtype=int))
+
+        final_idxs = np.concatenate(selected) if selected else np.array([], dtype=int)
+        if len(final_idxs) < n:
+            remaining = np.setdiff1d(unlabeled_idxs, final_idxs, assume_unique=False)
+            remaining_positions = np.nonzero(np.isin(unlabeled_idxs, remaining))[0]
+            remaining_idxs = unlabeled_idxs[remaining_positions]
+            fill_score = stable_score if stable_ratio >= 0.5 else boundary_score
+            remaining_score = fill_score[remaining_positions]
+            order = remaining_score.sort(descending=True)[1].numpy()
+            final_idxs = np.concatenate([final_idxs, remaining_idxs[order[:n - len(final_idxs)]]])
+        return final_idxs[:n]
+
+
 # ==========================================
 # 5. 工厂函数
 # ==========================================
 def get_strategy(name):
-    if name in ['ExpertDisagreementAdaptiveSampling', 'Adaptive']:
+    if name in ['BoundaryMarginJSSampling', 'BAEDSampling', 'MarginJS']:
+        return BoundaryMarginJSSampling
+    elif name in ['ExpertDisagreementAdaptiveSampling', 'Adaptive']:
         return ExpertDisagreementAdaptiveSampling
     elif name == 'EntropySampling':
         return EntropySampling
@@ -321,7 +503,7 @@ def get_strategy(name):
         return NovelEntropySampling
     elif name == 'NovelMargin':
         return NovelMarginSampling
-    elif name == 'NovelAdaptive':
+    elif name in ['NovelAdaptive', 'NovelMarginSamplingAdaptive']:
         return NovelMarginSamplingAdaptive
     else:
         raise NotImplementedError(f"策略 {name} 未在 ncd_strategies.py 中注册！")

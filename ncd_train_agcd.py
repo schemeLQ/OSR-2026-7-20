@@ -3,13 +3,18 @@ import torch
 import numpy as np
 import random
 import argparse
+import csv
+import datetime
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import CIFAR10, CIFAR100
+from PIL import Image
 from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
 
+from datasets.osr_loader import Tiny_ImageNet_Filter
+from osr_main import splits_AUROC
 from ncd_model import NCDWrapper
 from ncd_losses import SupConLoss, InfoNCELoss
 from ncd_utils import TwoCropTransform, cluster_acc
@@ -36,6 +41,293 @@ def set_seeding(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
+def _harmonic_mean(values, eps=1e-12):
+    values = np.asarray(values, dtype=np.float64)
+    if np.any(values <= 0):
+        return 0.0
+    return float(len(values) / np.sum(1.0 / (values + eps)))
+
+
+def make_ncd_save_dir(args):
+    run_time = datetime.datetime.now().strftime("%m%d_%H%M")
+    save_root = getattr(args, 'save_root', './ckpt/ncd_al')
+    save_dir = os.path.join(save_root, str(args.dataset).lower(), run_time)
+    os.makedirs(save_dir, exist_ok=True)
+    args.run_time = run_time
+    args.save_dir = save_dir
+    return save_dir
+
+
+def save_ncd_checkpoint(save_dir, filename, model, ema_teacher, args, round_idx,
+                        metrics, active_dataset=None, dynamic_alignment=None):
+    payload = {
+        'round': round_idx,
+        'model_state_dict': model.state_dict(),
+        'ema_teacher_state_dict': ema_teacher.state_dict() if ema_teacher is not None else None,
+        'metrics': metrics,
+        'args': vars(args),
+        'dynamic_alignment': dynamic_alignment,
+    }
+    if active_dataset is not None:
+        payload['labeled_mask'] = active_dataset.labeled_mask.astype(np.bool_)
+        payload['labeled_indices'] = np.where(active_dataset.labeled_mask)[0]
+    path = os.path.join(save_dir, filename)
+    torch.save(payload, path)
+    return path
+
+
+def write_ncd_summary(save_dir, all_results, args, aosdq=None):
+    fields = ['round', 'budget', 'acc', 'nmi', 'ari', 'known_acc', 'udr', 'ca', 'osca', 'osdq']
+    rows = []
+    for r, acc, nmi, ari, known_acc, udr, ca, osca, osdq in all_results:
+        rows.append({
+            'round': r,
+            'budget': r * args.query_size,
+            'acc': acc,
+            'nmi': nmi,
+            'ari': ari,
+            'known_acc': known_acc,
+            'udr': udr,
+            'ca': ca,
+            'osca': osca,
+            'osdq': osdq,
+        })
+
+    csv_path = os.path.join(save_dir, 'summary.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    txt_path = os.path.join(save_dir, 'summary.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write('NCD Active Discovery Summary\n')
+        f.write('=' * 96 + '\n')
+        f.write(f'dataset={args.dataset}\n')
+        f.write(f'known={getattr(args, "known", [])}\n')
+        f.write(f'unknown={getattr(args, "unknown", [])}\n')
+        f.write(f'query_size={args.query_size}, al_rounds={args.al_rounds}, epochs_per_round={args.epochs_per_round}\n')
+        f.write(f'ckpt={args.ckpt}\n')
+        f.write(f'save_dir={save_dir}\n\n')
+        f.write(f"{'Round':^6} | {'Budget':^8} | {'ACC(%)':^8} | {'NMI(%)':^8} | {'ARI(%)':^8} | {'KAcc(%)':^8} | {'UDR(%)':^8} | {'CA(%)':^7} | {'OSCA(%)':^8} | {'OSDQ(%)':^8}\n")
+        f.write('-' * 112 + '\n')
+        for row in rows:
+            f.write(
+                f"{row['round']:^6} | {row['budget']:^8} | {row['acc']:^8.2f} | "
+                f"{row['nmi']:^8.2f} | {row['ari']:^8.2f} | {row['known_acc']:^8.2f} | "
+                f"{row['udr']:^8.2f} | {row['ca']:^7.2f} | {row['osca']:^8.2f} | {row['osdq']:^8.2f}\n"
+            )
+        f.write('=' * 96 + '\n')
+        if aosdq is not None:
+            f.write(f'AOSDQ={aosdq:.2f}%\n')
+        if rows:
+            best_osdq = max(rows, key=lambda x: x['osdq'])
+            best_osca = max(rows, key=lambda x: x['osca'])
+            f.write(f"Best OSDQ: round={best_osdq['round']}, budget={best_osdq['budget']}, OSDQ={best_osdq['osdq']:.2f}%\n")
+            f.write(f"Best OSCA: round={best_osca['round']}, budget={best_osca['budget']}, OSCA={best_osca['osca']:.2f}%\n")
+    return csv_path, txt_path
+
+
+class RemappedVisionDataset(Dataset):
+    """Dataset wrapper whose labels are already remapped to 0..K-1."""
+
+    def __init__(self, data, targets, transform=None):
+        self.data = data
+        self.targets = np.asarray(targets, dtype=np.int64)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.targets)
+
+    @staticmethod
+    def _to_pil(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        if isinstance(x, np.ndarray):
+            if x.ndim == 3 and x.shape[0] == 3:
+                x = np.transpose(x, (1, 2, 0))
+            if x.dtype != np.uint8:
+                x = np.clip(x, 0, 255).astype(np.uint8)
+            return Image.fromarray(x)
+        return x
+
+    def __getitem__(self, index):
+        img = self._to_pil(self.data[index])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, int(self.targets[index])
+
+
+def infer_dataset_from_ckpt_path(ckpt_path):
+    path = str(ckpt_path or '').replace('\\', '/').lower()
+    if 'tiny_imagenet' in path or 'tiny-imagenet' in path:
+        return 'tiny_imagenet'
+    if 'cifar_plus' in path or 'cifar-plus' in path:
+        return 'cifar_plus'
+    if 'cifar100' in path:
+        return 'cifar100'
+    if 'cifar10' in path:
+        return 'cifar10'
+    return None
+
+
+def load_ckpt_options(ckpt_path):
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        return {}
+    try:
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        return dict(ckpt.get('options', {})) if isinstance(ckpt, dict) else {}
+    except Exception:
+        return {}
+
+
+def _select_remap(data, targets, classes, offset=0):
+    targets = np.asarray(targets)
+    cls_to_new = {int(c): offset + i for i, c in enumerate(classes)}
+    idx = np.where(np.isin(targets, list(cls_to_new.keys())))[0]
+    new_targets = np.asarray([cls_to_new[int(targets[i])] for i in idx], dtype=np.int64)
+    return np.asarray(data)[idx], new_targets
+
+
+def _tiny_data(root, split):
+    ds = Tiny_ImageNet_Filter(os.path.join(root, 'tiny-imagenet-200', split), None, fast_tensor=True)
+    return ds.memory_data.cpu().numpy(), ds.memory_targets.cpu().numpy()
+
+
+def _protocol_classes(args, ckpt_options):
+    dataset = args.dataset
+    item = int(ckpt_options.get('item', getattr(args, 'item', 0)))
+    plus_num = int(ckpt_options.get('plus_num', getattr(args, 'plus_num', 10)))
+
+    if ckpt_options.get('known'):
+        known = list(ckpt_options['known'])
+    elif dataset == 'cifar10':
+        known = [0, 1, 2, 4, 5, 9]
+    else:
+        split_key = 'cifar_plus' if dataset == 'cifar_plus' else dataset
+        split = splits_AUROC[split_key]
+        known = list(split[min(item, len(split) - 1)])
+
+    if ckpt_options.get('unknown'):
+        unknown = list(ckpt_options['unknown'])
+    elif dataset == 'cifar_plus':
+        key = f'cifar100-{plus_num}'
+        if key in splits_AUROC:
+            unknown = list(splits_AUROC[key][min(item, len(splits_AUROC[key]) - 1)])
+        else:
+            rng = np.random.default_rng(item + 42)
+            unknown = rng.permutation(100)[:plus_num].tolist()
+    else:
+        total = 200 if dataset == 'tiny_imagenet' else (100 if dataset == 'cifar100' else 10)
+        unknown = sorted(list(set(range(total)) - set(known)))
+
+    return known, unknown, item, plus_num
+
+
+def build_ncd_protocol(args):
+    if str(args.dataset).lower() == 'auto':
+        args.dataset = infer_dataset_from_ckpt_path(args.ckpt) or 'cifar10'
+    supported = {'cifar10', 'cifar_plus', 'cifar100', 'tiny_imagenet'}
+    if args.dataset not in supported:
+        raise NotImplementedError(f'Unsupported NCD dataset: {args.dataset}. Supported: {sorted(supported)}')
+
+    ckpt_options = load_ckpt_options(args.ckpt)
+    known, unknown, item, plus_num = _protocol_classes(args, ckpt_options)
+    args.item = item
+    args.plus_num = plus_num
+    args.known = known
+    args.unknown = unknown
+    args.num_known = len(known)
+    if not getattr(args, 'estimate_classes', False):
+        args.num_unknown_est = len(unknown)
+
+    img_size = 64 if args.dataset == 'tiny_imagenet' else 32
+    mean, std = (0.5, 0.5, 0.5), (0.25, 0.25, 0.25)
+    args.img_size = img_size
+    args.ncd_mean = mean
+    args.ncd_std = std
+    crop_pad = int(img_size * 0.125)
+
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(img_size, padding=crop_pad),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)])
+    ncd_transform = TwoCropTransform(transforms.Compose([
+        transforms.RandomCrop(img_size, padding=crop_pad),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)]))
+    test_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+    strong_transform = transforms.Compose([
+        transforms.RandomCrop(img_size, padding=crop_pad),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandAugment(num_ops=2, magnitude=5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ]) if args.use_egdb else None
+
+    if args.dataset == 'cifar10':
+        tr = CIFAR10(root=args.data_root, train=True, download=True)
+        te = CIFAR10(root=args.data_root, train=False, download=True)
+        train_known_data, train_known_targets = _select_remap(tr.data, tr.targets, known, 0)
+        train_unknown_data, train_unknown_targets = _select_remap(tr.data, tr.targets, unknown, len(known))
+        test_known_data, test_known_targets = _select_remap(te.data, te.targets, known, 0)
+        test_unknown_data, test_unknown_targets = _select_remap(te.data, te.targets, unknown, len(known))
+    elif args.dataset == 'cifar100':
+        tr = CIFAR100(root=args.data_root, train=True, download=True)
+        te = CIFAR100(root=args.data_root, train=False, download=True)
+        train_known_data, train_known_targets = _select_remap(tr.data, tr.targets, known, 0)
+        train_unknown_data, train_unknown_targets = _select_remap(tr.data, tr.targets, unknown, len(known))
+        test_known_data, test_known_targets = _select_remap(te.data, te.targets, known, 0)
+        test_unknown_data, test_unknown_targets = _select_remap(te.data, te.targets, unknown, len(known))
+    elif args.dataset == 'cifar_plus':
+        c10_tr = CIFAR10(root=args.data_root, train=True, download=True)
+        c10_te = CIFAR10(root=args.data_root, train=False, download=True)
+        c100_tr = CIFAR100(root=args.data_root, train=True, download=True)
+        c100_te = CIFAR100(root=args.data_root, train=False, download=True)
+        train_known_data, train_known_targets = _select_remap(c10_tr.data, c10_tr.targets, known, 0)
+        train_unknown_data, train_unknown_targets = _select_remap(c100_tr.data, c100_tr.targets, unknown, len(known))
+        test_known_data, test_known_targets = _select_remap(c10_te.data, c10_te.targets, known, 0)
+        test_unknown_data, test_unknown_targets = _select_remap(c100_te.data, c100_te.targets, unknown, len(known))
+    else:
+        train_all_data, train_all_targets = _tiny_data(args.data_root, 'train')
+        val_all_data, val_all_targets = _tiny_data(args.data_root, 'val')
+        train_known_data, train_known_targets = _select_remap(train_all_data, train_all_targets, known, 0)
+        train_unknown_data, train_unknown_targets = _select_remap(train_all_data, train_all_targets, unknown, len(known))
+        test_known_data, test_known_targets = _select_remap(val_all_data, val_all_targets, known, 0)
+        test_unknown_data, test_unknown_targets = _select_remap(val_all_data, val_all_targets, unknown, len(known))
+
+    train_data = np.concatenate([train_known_data, train_unknown_data], axis=0)
+    train_targets = np.concatenate([train_known_targets, train_unknown_targets], axis=0)
+    test_data = np.concatenate([test_known_data, test_unknown_data], axis=0)
+    test_targets = np.concatenate([test_known_targets, test_unknown_targets], axis=0)
+
+    trainset_base = RemappedVisionDataset(train_data, train_targets)
+    testset_eval = RemappedVisionDataset(test_data, test_targets, transform=test_transform)
+    initial_indices = np.where(trainset_base.targets < args.num_known)[0].tolist()
+
+    print(f"   [Protocol] dataset={args.dataset} img_size={img_size}")
+    print(f"   [Protocol] known={known}")
+    print(f"   [Protocol] unknown={unknown[:20]}{' ...' if len(unknown) > 20 else ''}")
+    print(f"   [Protocol] num_known={args.num_known} num_unknown={args.num_unknown_est}")
+
+    return {
+        'trainset_base': trainset_base,
+        'raw_trainset': trainset_base,
+        'testset_eval': testset_eval,
+        'initial_indices': initial_indices,
+        'train_transform': train_transform,
+        'ncd_transform': ncd_transform,
+        'test_transform': test_transform,
+        'strong_transform': strong_transform,
+    }
 
 
 
@@ -77,9 +369,12 @@ def evaluate(model, loader, device, num_known=6, round_idx=0):
     ari = adjusted_rand_score(targets_np, preds_np) * 100
 
     threshold = 0.85 - (round_idx * 0.02)
+    actual_known_mask = targets_np < num_known
     actual_unknown_mask = targets_np >= num_known
     total_actual_unknowns = np.sum(actual_unknown_mask)
     pred_unknown_mask = (preds_np >= num_known) | (max_known_confs_np < threshold)
+    known_correct_mask = actual_known_mask & (preds_np == targets_np) & (~pred_unknown_mask)
+    known_acc = np.sum(known_correct_mask) / np.sum(actual_known_mask) if np.sum(actual_known_mask) > 0 else 0.0
     identified_unknown_mask = actual_unknown_mask & pred_unknown_mask
     identified_count = np.sum(identified_unknown_mask)
 
@@ -89,14 +384,13 @@ def evaluate(model, loader, device, num_known=6, round_idx=0):
     else:
         ca = 0.0
     osca = 2 * udr * ca / (udr + ca) * 100 if (udr + ca) > 0 else 0.0
+    osdq = _harmonic_mean([known_acc, udr, ca]) * 100
 
-    return acc, nmi, ari, udr * 100, ca * 100, osca
+    return acc, nmi, ari, known_acc * 100, udr * 100, ca * 100, osca, osdq
 
 
 def remap_labels(targets, device):
-    mapping = {0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 9: 5, 3: 6, 6: 7, 7: 8, 8: 9}
-    remapped = [mapping[t.item()] for t in targets]
-    return torch.tensor(remapped, dtype=torch.long, device=device)
+    return targets.to(device=device, dtype=torch.long)
 
 
 def get_dynamic_label_mapping(model, loader, device, num_known=6, num_unknown=4):
@@ -193,54 +487,49 @@ def train_agcd(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Starting AGCD Training...")
 
-    mean, std = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
-
-    # ================================================================
-    # ncd_transform 始终是 TwoCropTransform，与基线完全一致
-    # 强增强视图由 strong_transform 在训练循环内按需临时生成
-    # ================================================================
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(), transforms.Normalize(mean, std)])
-
-    ncd_transform = TwoCropTransform(transforms.Compose([
-        transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-        transforms.RandomGrayscale(p=0.2), transforms.ToTensor(), transforms.Normalize(mean, std)]))
-
-    test_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-
-    # EGDB 专用的强增强（对 PIL 图像操作，不进 DataLoader）
-    strong_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.RandAugment(num_ops=2, magnitude=5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ]) if args.use_egdb else None
-
-    trainset_base = CIFAR10(root=args.data_root, train=True, download=True)
-    # raw_trainset 用于 EGDB：通过索引拿到原始 PIL 图像，临时生成强增强视图
-    raw_trainset = CIFAR10(root=args.data_root, train=True, download=False)
-
-    testset_eval = CIFAR10(root=args.data_root, train=False, transform=test_transform, download=True)
+    protocol = build_ncd_protocol(args)
+    save_dir = make_ncd_save_dir(args)
+    print(f"   💾 [NCD SaveDir] {save_dir}")
+    train_transform = protocol['train_transform']
+    ncd_transform = protocol['ncd_transform']
+    test_transform = protocol['test_transform']
+    strong_transform = protocol['strong_transform']
+    trainset_base = protocol['trainset_base']
+    raw_trainset = protocol['raw_trainset']
+    testset_eval = protocol['testset_eval']
     loader_test = DataLoader(testset_eval, batch_size=256, shuffle=False, num_workers=args.num_workers)
 
     active_dataset = ActiveDataset(trainset_base)
-    KNOWN_CLASSES = [0, 1, 2, 4, 5, 9]
-    initial_indices = [i for i, t in enumerate(trainset_base.targets) if t in KNOWN_CLASSES]
+    initial_indices = protocol['initial_indices']
     active_dataset.initialize_labels(initial_indices)
 
     print(f"   Pool: {len(initial_indices)} Labeled | {len(trainset_base) - len(initial_indices)} Unlabeled")
 
-    osr_backbone = MultiBranchNet(args={
-        'img_size': 32, 'backbone': 'resnet18', 'projection_dim': -1,
-        'num_known': args.num_known, 'gate_temp': 0.1
-    }).to(device)
-    if args.ckpt:
-        osr_backbone.load_state_dict(torch.load(args.ckpt, map_location=device), strict=False)
+    ckpt_uses_bacl = False
+    ckpt_legacy_split = False
+    if args.ckpt and os.path.exists(args.ckpt):
+        ckpt_probe = torch.load(args.ckpt, map_location='cpu')
+        probe_sd = ckpt_probe.get('net', ckpt_probe.get('state_dict', ckpt_probe))
+        probe_sd = {k.replace('module.', ''): v for k, v in probe_sd.items()}
+        has_bacl = any(k.startswith('bacl') for k in probe_sd)
+        has_se = any(k.startswith('se') for k in probe_sd)
+        l4_key = 'branch1_l4.0.0.residual_function.0.weight'
+        if l4_key in probe_sd and probe_sd[l4_key].shape[0] == 64:
+            ckpt_legacy_split = True
+        ckpt_uses_bacl = has_bacl and not has_se
+        if ckpt_uses_bacl:
+            print("   🔧 [Backbone Compat] 检测到 BACL 版 OSR backbone，NCD 阶段启用 use_bacl=True")
+        if ckpt_legacy_split:
+            print("   🔧 [Backbone Compat] 检测到旧版 MEDAF 分层，NCD 阶段启用 legacy_split=True")
+
+    backbone_args = {
+        'img_size': args.img_size, 'backbone': 'resnet18', 'projection_dim': -1,
+        'num_known': args.num_known, 'gate_temp': 0.1,
+        'use_bacl': ckpt_uses_bacl,
+        'legacy_split': ckpt_legacy_split
+    }
+
+    osr_backbone = MultiBranchNet(args=backbone_args).to(device)
 
     if getattr(args, 'estimate_classes', False):
         estimated_unknown = estimate_novel_classes_only(
@@ -260,10 +549,7 @@ def train_agcd(args):
     # QA-P²OT 初始化：EMA teacher + 标注感知 Sinkhorn 求解器
     # 在 model 构建完成后立即创建 teacher（参数相同，不参与梯度）
     # ================================================================
-    osr_backbone_t = MultiBranchNet(args={
-        'img_size': 32, 'backbone': 'resnet18', 'projection_dim': -1,
-        'num_known': args.num_known, 'gate_temp': 0.1
-    }).to(device)
+    osr_backbone_t = MultiBranchNet(args=backbone_args).to(device)
     adapter_t = Adapter(in_dim=512, out_dim=512)
     dino_head_t = DINOHead(in_dim=512, out_dim=args.num_known + args.num_unknown_est)
 
@@ -286,11 +572,24 @@ def train_agcd(args):
         rho_novel=args.ot_rho_novel,
         n_iter=30,          # Sinkhorn 迭代次数（30 次足够 10 类 CIFAR-10）
         alpha=1.0,          # Laplace 平滑，防止新类先验为零
-        c_virtual=2.0,      # 虚拟簇代价，越大 = 越少样本被过滤
+        c_virtual=args.ot_c_virtual,
+        query_prior_weight=args.ot_query_prior_weight,
+        prior_floor=args.ot_prior_floor,
+        ot_temp=args.ot_temp,
+        lambda_dis=args.ot_lambda_dis,
+        lambda_u=args.ot_lambda_u,
+        use_adaptive_rho=args.ot_use_adaptive_rho,
+        rho_min=args.ot_rho_min,
+        rho_max=args.ot_rho_max,
+        rho_beta=args.ot_rho_beta,
+        rho_gamma=args.ot_rho_gamma,
         novel_only_unlabeled=True
     )
     print(f"   [QA-P²OT] OT solver initialized: "
           f"eps={ot_solver.eps}, rho_novel={ot_solver.rho_novel}, "
+          f"q_w={ot_solver.query_prior_weight}, prior_floor={ot_solver.prior_floor}, "
+          f"temp={ot_solver.ot_temp}, lambda_dis={ot_solver.lambda_dis}, "
+          f"lambda_u={ot_solver.lambda_u}, adaptive_rho={ot_solver.use_adaptive_rho}, "
           f"n_iter={ot_solver.n_iter}")
 
     # EGDB 损失：feat_loss_w=0 关掉特征对齐，只用分类一致性，梯度不流回 backbone
@@ -320,8 +619,10 @@ def train_agcd(args):
                 loss_m.append(loss.item())
                 pbar.set_postfix({'Loss': f"{np.mean(loss_m):.4f}"})
 
-    dynamic_alignment = {i: i for i in range(10)}
+    dynamic_alignment = {i: i for i in range(args.num_known + args.num_unknown_est)}
     all_results = []
+    best_osdq = -1.0
+    best_osca = -1.0
 
     for round_idx in range(args.al_rounds + 1):
         print(f"\n======== Round {round_idx} / {args.al_rounds} ========")
@@ -385,6 +686,11 @@ def train_agcd(args):
             for epoch in range(args.epochs_per_round):
                 model.train()
                 loss_meter = []
+                rel_meter = []
+                ot_stat_meter = {
+                    'rho': [], 'edis': [], 'eagr': [], 'real': [],
+                    'virt': [], 'wmin': [], 'wmax': []
+                }
                 egdb_fr_list = []
 
                 # ========================================================
@@ -408,7 +714,7 @@ def train_agcd(args):
 
 
 
-                for u_images, u_idxs, _ in pbar:
+                for u_images, _, u_idxs in pbar:
                     try:
                         l_images, l_targets, _ = next(iter_labeled)
                     except StopIteration:
@@ -444,26 +750,59 @@ def train_agcd(args):
                     #   先验 q 由当前标注分布决定（已知类权重 >> 新类权重）
                     # ================================================================
                     with torch.no_grad():
-                        ot_targets = ot_solver.get_targets(
+                        ot_expert_logits = None
+                        if args.ot_lambda_dis > 0 or args.ot_lambda_u > 0 or args.ot_use_adaptive_rho:
+                            try:
+                                ot_expert_logits = ema_teacher.forward_experts(
+                                    u_inputs, use_strong_head=False
+                                )  # [2B, 3, K]
+                            except Exception as e:
+                                if len(ot_stat_meter['rho']) == 0:
+                                    print(f"   ⚠️ [QA-P²OT] Expert logits disabled for OT: {e}")
+                        ot_targets, ot_reliability = ot_solver.get_targets(
                             student_logits=u_logits.detach(),
                             teacher_model=ema_teacher,
                             u_inputs=u_inputs,
                             active_dataset=active_dataset,
                             all_targets=trainset_base.targets,  # 🚀 直接把外部最纯粹的标签列表传进去
                             device=device,
-                            round_idx=round_idx
+                            round_idx=round_idx,
+                            epoch=epoch + 1,
+                            max_epoch=args.epochs_per_round,
+                            expert_logits=ot_expert_logits,
+                            return_reliability=True
                         )
 
                     bs = u_view1.size(0)
                     log_probs = F.log_softmax(u_logits / 0.1, dim=1)
-                    targets_swapped = torch.cat([ot_targets[bs:], ot_targets[:bs]], dim=0)
-                    loss_cluster = -torch.mean(torch.sum(targets_swapped * log_probs, dim=1))
+                    weights_swapped = torch.cat([ot_reliability[bs:], ot_reliability[:bs]], dim=0).detach()
+
+                    if args.ot_use_reliability_weight:
+                        targets_swapped = torch.cat([ot_targets[bs:], ot_targets[:bs]], dim=0).detach()
+                        loss_each = -torch.sum(targets_swapped * log_probs, dim=1)
+                        loss_cluster = (
+                            weights_swapped * loss_each
+                        ).sum() / (weights_swapped.sum().detach() + 1e-8)
+                    elif round_idx == 0:
+                        # Round 0 still needs broad pseudo-label supervision to form novel clusters.
+                        # Use reliability as soft smoothing instead of suppressing low-reliability samples.
+                        uniform_targets = torch.ones_like(ot_targets) / ot_targets.size(1)
+                        ot_rel_2d = ot_reliability.unsqueeze(1)
+                        ot_targets_for_loss = ot_rel_2d * ot_targets + (1 - ot_rel_2d) * uniform_targets
+                        targets_swapped = torch.cat([ot_targets_for_loss[bs:], ot_targets_for_loss[:bs]], dim=0)
+                        loss_cluster = -torch.mean(torch.sum(targets_swapped * log_probs, dim=1))
+                    else:
+                        # After the first query round, active labels stabilize the structure; reliability
+                        # weighting can down-weight boundary/noisy samples without starving cluster formation.
+                        targets_swapped = torch.cat([ot_targets[bs:], ot_targets[:bs]], dim=0).detach()
+                        per_sample_cluster = -torch.sum(targets_swapped * log_probs, dim=1)
+                        loss_cluster = (
+                            weights_swapped * per_sample_cluster
+                        ).sum() / weights_swapped.sum().clamp_min(1e-6)
+
                     loss_ent = -torch.mean(
                         torch.sum(F.softmax(u_logits, dim=1) * F.log_softmax(u_logits, dim=1), dim=1))
 
-
-                    # 将 ce 损失权重提高，使其主导梯度
-                    loss_sup_ce = F.cross_entropy(l_logits, l_targets_remapped)
 
                     # ================================================================
                     # 损失权重：恢复 loss_cluster=0.4（之前被错误降到 0.2）
@@ -521,36 +860,80 @@ def train_agcd(args):
                     )
 
                     loss_meter.append(loss.item())
+                    rel_meter.append(weights_swapped.mean().item())
+                    ot_stats = getattr(ot_solver, 'last_stats', {})
+                    if ot_stats:
+                        ot_stat_meter['rho'].append(ot_stats.get('rho_current', 0.0))
+                        ot_stat_meter['edis'].append(ot_stats.get('expert_dis', 0.0))
+                        ot_stat_meter['eagr'].append(ot_stats.get('expert_agreement', 1.0))
+                        ot_stat_meter['real'].append(ot_stats.get('real_mass', 0.0))
+                        ot_stat_meter['virt'].append(ot_stats.get('virtual_mass', 0.0))
+                        ot_stat_meter['wmin'].append(ot_stats.get('weight_min', 0.0))
+                        ot_stat_meter['wmax'].append(ot_stats.get('weight_max', 0.0))
                     postfix = {'L': f"{np.mean(loss_meter):.3f}"}
+                    postfix['rel'] = f"{np.mean(rel_meter):.2f}"
+                    if ot_stat_meter['rho']:
+                        postfix['rho'] = f"{np.mean(ot_stat_meter['rho']):.2f}"
+                        postfix['ed'] = f"{np.mean(ot_stat_meter['edis']):.4f}"
+                        postfix['rm'] = f"{np.mean(ot_stat_meter['real']):.4f}"
                     if egdb_active and egdb_fr_list:
                         postfix['fr'] = f"{np.mean(egdb_fr_list):.2f}"
                     pbar.set_postfix(postfix)
 
+                if ot_stat_meter['rho']:
+                    print(
+                        f"   [QA-P²OT] rho={np.mean(ot_stat_meter['rho']):.4f} "
+                        f"edis={np.mean(ot_stat_meter['edis']):.6f} "
+                        f"eagr={np.mean(ot_stat_meter['eagr']):.4f} "
+                        f"real_mass={np.mean(ot_stat_meter['real']):.6f} "
+                        f"virtual_mass={np.mean(ot_stat_meter['virt']):.6f} "
+                        f"w={np.mean(rel_meter):.4f} "
+                        f"w_min={np.mean(ot_stat_meter['wmin']):.4f} "
+                        f"w_max={np.mean(ot_stat_meter['wmax']):.4f} "
+                        f"loss_cluster={loss_cluster.item():.4f}"
+                    )
+
                 scheduler.step()
 
-        acc, nmi, ari, udr, ca, osca = evaluate(
+        acc, nmi, ari, known_acc, udr, ca, osca, osdq = evaluate(
             model, loader_test, device, args.num_known, round_idx=round_idx)
-        all_results.append((round_idx, acc, nmi, ari, udr, ca, osca))
-        print(f"Round {round_idx} | ACC={acc:.2f}% NMI={nmi:.2f}% ARI={ari:.2f}% | UDR={udr:.2f}% CA={ca:.2f}% OSCA={osca:.2f}%")
+        metrics = {
+            'acc': acc, 'nmi': nmi, 'ari': ari, 'known_acc': known_acc,
+            'udr': udr, 'ca': ca, 'osca': osca, 'osdq': osdq,
+        }
+        all_results.append((round_idx, acc, nmi, ari, known_acc, udr, ca, osca, osdq))
+        print(f"Round {round_idx} | ACC={acc:.2f}% NMI={nmi:.2f}% ARI={ari:.2f}% | KAcc={known_acc:.2f}% UDR={udr:.2f}% CA={ca:.2f}% OSCA={osca:.2f}% OSDQ={osdq:.2f}%")
+
+        round_ckpt = save_ncd_checkpoint(
+            save_dir, f'round_{round_idx:02d}.pth', model, ema_teacher, args,
+            round_idx, metrics, active_dataset, dynamic_alignment)
+        print(f"   💾 [Checkpoint] Saved {round_ckpt}")
+
+        if osdq > best_osdq:
+            best_osdq = osdq
+            best_path = save_ncd_checkpoint(
+                save_dir, 'model_best_osdq.pth', model, ema_teacher, args,
+                round_idx, metrics, active_dataset, dynamic_alignment)
+            print(f"   ⭐ [Best OSDQ] {best_osdq:.2f}% -> {best_path}")
+
+        if osca > best_osca:
+            best_osca = osca
+            best_path = save_ncd_checkpoint(
+                save_dir, 'model_best_osca.pth', model, ema_teacher, args,
+                round_idx, metrics, active_dataset, dynamic_alignment)
+            print(f"   ⭐ [Best OSCA] {best_osca:.2f}% -> {best_path}")
+
+        write_ncd_summary(save_dir, all_results, args)
 
         if round_idx == 0 and not args.resume_round0:
-            os.makedirs('./ckpt/ncd_al', exist_ok=True)
-            torch.save({'model_state_dict': model.state_dict()}, './ckpt/ncd_al/round0_trained.pth')
-            print("   💾 [Backup] Round 0 训练特征已自动备份至: ./ckpt/ncd_al/round0_trained.pth")
+            legacy_round0 = os.path.join(save_dir, 'round0_trained.pth')
+            torch.save({'model_state_dict': model.state_dict(), 'metrics': metrics, 'args': vars(args)}, legacy_round0)
+            print(f"   💾 [Backup] Round 0 训练特征已自动备份至: {legacy_round0}")
 
         if round_idx < args.al_rounds:
             print(f"   [Active Learning] 正在初始化策略: {args.strategy}")
 
             strategy_class = get_strategy(args.strategy)
-            strategy_instance = strategy_class(active_dataset, model, args, device)
-
-            eval_transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-            ])
-
-            # 强制让 strategy_instance 内部的数据集使用这个干净的转换
-
             strategy_instance = strategy_class(active_dataset, model, args, device)
 
             # 🚀 统一调用：无论什么策略，都把需要的 Round 信息传进去
@@ -572,23 +955,39 @@ def train_agcd(args):
                 model, all_labeled_loader, device, args.num_known, args.num_unknown_est)
 
     # ── Final Summary Table ────────────────────────────────────────────
-    print("\n" + "=" * 74)
-    print(f"{'Round':^6} | {'ACC(%)':^8} | {'NMI(%)':^8} | {'ARI(%)':^8} | {'UDR(%)':^8} | {'CA(%)':^7} | {'OSCA(%)':^8}")
-    print("-" * 74)
-    for r, acc, nmi, ari, udr, ca, osca in all_results:
-        print(f"{r:^6} | {acc:^8.2f} | {nmi:^8.2f} | {ari:^8.2f} | {udr:^8.2f} | {ca:^7.2f} | {osca:^8.2f}")
-    print("=" * 74)
+    print("\n" + "=" * 96)
+    print(f"{'Round':^6} | {'ACC(%)':^8} | {'NMI(%)':^8} | {'ARI(%)':^8} | {'KAcc(%)':^8} | {'UDR(%)':^8} | {'CA(%)':^7} | {'OSCA(%)':^8} | {'OSDQ(%)':^8}")
+    print("-" * 96)
+    for r, acc, nmi, ari, known_acc, udr, ca, osca, osdq in all_results:
+        print(f"{r:^6} | {acc:^8.2f} | {nmi:^8.2f} | {ari:^8.2f} | {known_acc:^8.2f} | {udr:^8.2f} | {ca:^7.2f} | {osca:^8.2f} | {osdq:^8.2f}")
+    print("=" * 96)
+    aosdq = None
+    if len(all_results) > 1:
+        budgets = np.asarray([r * args.query_size for r, *_ in all_results], dtype=np.float64)
+        osdq_values = np.asarray([row[-1] for row in all_results], dtype=np.float64)
+        if budgets[-1] > budgets[0]:
+            aosdq = float(np.trapz(osdq_values, budgets) / (budgets[-1] - budgets[0]))
+            print(f"AOSDQ={aosdq:.2f}%  (area under OSDQ-budget curve)")
+    csv_path, txt_path = write_ncd_summary(save_dir, all_results, args, aosdq=aosdq)
+    print(f"Saved NCD summary to: {txt_path}")
+    print(f"Saved NCD metrics csv to: {csv_path}")
+    print(f"Saved NCD checkpoints to: {save_dir}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', type=str,
-                        default=r'C:\Users\10943\PycharmProjects\PythonProject\MEDAF\ckpt\osr\cifar10\0513_2201\medaf_backbone_converted.pth')
+                        default=r'C:\Users\10943\PycharmProjects\PythonProject\MEDAF\ckpt\osr\tiny_imagenet\0715_2245\medaf_backbone_converted.pth')
     parser.add_argument('--data_root', type=str,
                         default=r'C:\Users\10943\PycharmProjects\PythonProject\MEDAF\data')
+    parser.add_argument('--save_root', type=str, default='./ckpt/ncd_al',
+                        help='NCD checkpoint root. Saved as save_root/dataset/MMDD_HHMM/.')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--lr', type=float, default=0.01)
-    parser.add_argument('--dataset', type=str, default='cifar10')
+    parser.add_argument('--dataset', type=str, default='auto',
+                        help='auto/cifar10/cifar_plus/cifar100/tiny_imagenet')
+    parser.add_argument('--item', type=int, default=0, help='Open-set split index if ckpt has no saved options.')
+    parser.add_argument('--plus_num', type=int, default=10, help='For cifar_plus: number of CIFAR100 unknown classes.')
     parser.add_argument('--num_known', type=int, default=6)
     parser.add_argument('--num_unknown_est', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=128)
@@ -597,7 +996,13 @@ if __name__ == '__main__':
     parser.add_argument('--epochs_per_round', type=int, default=10)
     parser.add_argument('--query_size', type=int, default=300)
     parser.add_argument('--estimate_classes', action='store_true')
-    parser.add_argument('--strategy', type=str, default='ExpertDisagreementAdaptiveSampling')
+    parser.add_argument('--strategy', type=str, default='BoundaryMarginJSSampling')
+    parser.add_argument('--query_js_weight', type=float, default=0.6,
+                        help='BoundaryMarginJSSampling 中专家 JS 分歧的权重')
+    parser.add_argument('--query_margin_weight', type=float, default=0.4,
+                        help='BoundaryMarginJSSampling 中低 margin 不确定性的权重')
+    parser.add_argument('--query_stable_ratio', type=float, default=0.7,
+                        help='BoundaryMarginJSSampling 中 stable anchor 查询比例')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume_round0', type=str, default=None)
     parser.add_argument('--egdb_feat_w', type=float, default=0.2,
@@ -612,11 +1017,37 @@ if __name__ == '__main__':
 
     # QA-P²OT 参数
     parser.add_argument('--ot_eps', type=float, default=0.05,
-                        help='QA-P²OT Sinkhorn 温度（越小分配越硬）')
+                        help='QA-P2OT Sinkhorn 温度（越小分配越硬）')
     parser.add_argument('--ot_rho_novel', type=float, default=0.85,
                         help='新类虚拟簇过滤比例（1.0=不过滤，0.7=过滤30%%低置信）')
     parser.add_argument('--ot_ema_decay', type=float, default=0.999,
                         help='EMA teacher 动量')
+    parser.add_argument('--ot_temp', type=float, default=1.0,
+                        help='QA-P2OT 中 teacher/expert logits 转概率的 temperature')
+    parser.add_argument('--ot_c_virtual', type=float, default=1.0,
+                        help='虚拟簇基础代价，越大越不容易进入虚拟簇')
+    parser.add_argument('--ot_lambda_dis', type=float, default=0.5,
+                        help='class-wise expert disagreement 加到真实类代价的权重')
+    parser.add_argument('--ot_lambda_u', type=float, default=0.5,
+                        help='样本级专家不确定性降低虚拟簇代价的权重')
+    parser.add_argument('--ot_use_reliability_weight', action='store_true', default=True,
+                        help='使用虚拟簇真实质量作为 cluster loss 的样本可靠性权重')
+    parser.add_argument('--ot_no_reliability_weight', dest='ot_use_reliability_weight',
+                        action='store_false', help='关闭可靠性加权，回退到旧的 Round0 smoothing/后续加权逻辑')
+    parser.add_argument('--ot_query_prior_weight', type=float, default=0.6,
+                        help='主动查询分布进入 novel prior 的最大权重；会随 round warmup')
+    parser.add_argument('--ot_prior_floor', type=float, default=0.5,
+                        help='每个新类至少保留 ot_prior_floor/num_unknown_est 的 prior 容量')
+    parser.add_argument('--ot_use_adaptive_rho', action='store_true',
+                        help='开启专家一致性感知 adaptive rho')
+    parser.add_argument('--ot_rho_min', type=float, default=0.2,
+                        help='adaptive rho 最小值')
+    parser.add_argument('--ot_rho_max', type=float, default=0.95,
+                        help='adaptive rho 最大值')
+    parser.add_argument('--ot_rho_beta', type=float, default=0.1,
+                        help='adaptive rho EMA 平滑系数')
+    parser.add_argument('--ot_rho_gamma', type=float, default=0.7,
+                        help='专家一致性修正的保底系数')
 
     args = parser.parse_args()
     set_seeding(args.seed)

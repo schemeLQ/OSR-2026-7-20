@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python ncd_train_agcd.py --seed 71324)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(python -X utf8 ncd_train_agcd.py --seed 71324)"
+    ]
+  }
+}

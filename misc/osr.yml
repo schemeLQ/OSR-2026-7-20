@@ -1,0 +1,92 @@
+﻿split      : "AUROC"
+gpu_ids    : '0'
+use_wandb  : False
+resume     : False
+ckpt       : "_"
+seed       : 71324
+
+# --- Loss weights: [branch_CE_scale, gate_CE_scale, attnDiv_max] ---
+loss_wgts  : [1.0, 1.0, 0.4]   # Fix1: 分支CE与gate等权; diversity上限0.4
+div_warmup_epochs : 20     # first 20 epochs: no MoE attention-diversity pressure
+div_schedule      : "linear"   # linear | sigmoid; after warmup, ramp diversity gradually
+# score_wgts: [0,0,0]=energy(recommended) [0,1,0]=MLS [1,0,0]=MSP
+score_wgts : [0, 0, 0]
+branch_opt : -1
+gate_temp  : 100          # soft gate (≈uniform weight) ≡ ensemble of 3 branches
+gate_temp_end : 100       # no annealing — keep uniform weighting throughout
+
+dataset    : "tiny_imagenet"
+plus_num   : 10
+id_set     : "cifar10"
+ood_set    : "svhn"
+
+num_workers: 0
+epoch_num  : 150
+batch_size : 128
+save_step  : 150          # kept for compatibility; only final epoch is saved
+test_step  : 1
+backbone   : "resnet18"
+
+optimizer  : "SGD"
+lr         : 0.1
+weight_decay : 0.0        # Match the 3/3 baseline optimizer; set 5e-4 only for explicit regularized runs
+gamma      : 0.1
+milestones : [160, 180]   # used only when lr_scheduler=multistep
+lgs_temp   : 1            # Phase0: standard softmax temp (was 100)
+
+# ---- Phase 0: Vaze recipe additions ----
+use_se          : false   # BranchSE channel attention — lightweight BACL replacement
+use_bacl        : true    # Use the stronger BACL backbone for fair BAED comparison
+legacy_split    : true    # Restore old MEDAF/BACL branch split used by high-AUROC checkpoints
+use_odl         : true    # Enabled only for datasets listed in odl_datasets
+odl_datasets    : ["tiny_imagenet"]  # CIFAR10/SVHN are coarse enough that ODL often gives little benefit
+odl_start_epoch : 1      # Restore old behavior: ODL active from epoch 1
+odl_weight      : 0.1
+orth_weight     : 0.1     # BACL dictionary orthogonality regularization
+label_smoothing : 0.0
+lr_scheduler    : "multistep"   # 3/3 baseline used MultiStepLR; milestones >150 keep lr constant
+augment         : "standard"  # "standard" | "randaugment" | "autoaug"
+
+# ---- Innovation A: Cross-Branch Dictionary Orthogonality (CBDO) ----
+# 强制三个BACL字典互相正交，保证各分支捕获不同的混杂因子
+use_cbdo      : false   # CBDO depends on BACL dicts — disabled with BACL
+cbdo_weight   : 0.0
+
+# ---- Innovation B: Shared-Center Per-Branch ODL (SC-PB-ODL) ----
+# 三分支共享一个ODL实例(共享class centers)，每分支独立调用，各自被拉向同一类中心
+# 效果：各分支特征几何一致(GCD友好) + 梯度方向对L3无冲突(训练稳定)
+use_pb_odl      : false
+use_center_align    : false   # SC-PB-ODL已自然对齐，无需额外loss
+center_align_weight : 0.05    # 保留供消融实验
+
+# ---- BAED: Boundary-Aware Expert Diversification ----
+# 语义锚定一致 + 仅在低 margin 边界样本上制造专家分歧，避免专家跑去学背景
+use_baed           : false
+baed_start_epoch   : 20
+baed_anchor_weight : 0.03
+baed_div_weight    : 0.03
+baed_tau           : 1.0
+
+# ---- Innovation C: 多分支原型距离评分 (测试时，无需重训练) ----
+# 训练集计算per-branch类原型，测试时 score = max_branch(max_class cos_sim)
+use_proto_score  : false   # true = 最终评估时计算原型分数 (开启会多跑一次train_loader)
+
+# ---- ReAct (测试时，无需重训练) ----
+# 对每个 MoE branch 的 branch_l5 激活按训练集 percentile 截断，抑制 OOD 过大激活峰值
+use_react        : false
+react_percentile : 90
+react_max_values : 2000000
+
+# ---- BDS (可选对比项) ----
+# BDS = energy(gate) - bds_alpha * JS(b1,b2,b3) — 测试时，无需重训练
+use_consensus    : false   # 已证明有害(导致分支坍塌)，保留标志仅作记录
+bds_alpha     : 1.0
+use_bds_score : false
+
+# ---- Phase 1+ flags (all false = Phase0 baseline) ----
+use_rpl            : false
+use_per_branch_rpl : false
+use_branch_decorr  : false
+decorr_weight      : 0.1
+use_structure_pres : false
+

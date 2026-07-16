@@ -65,7 +65,6 @@ class NCDWrapper(nn.Module):
         self.backbone = backbone
         self.adapter = adapter
         self.dino_head = dino_head
-        self.adapter_strong = copy.deepcopy(adapter)
         # 🚀 物理隔离塔
         self.adapter_strong = copy.deepcopy(adapter)
         self.dino_head_strong = DINOHead(in_dim=512, out_dim=dino_head.last_layer.weight.shape[0])
@@ -74,25 +73,19 @@ class NCDWrapper(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # 仅解冻每个分支的最后一层 (Layer 5) 和相关的 BACL 门控层
-        # 这样模型既能保留 OSR 阶段的“去偏”骨架，又能微调“语义”
-            # 🟢 [半冻结逻辑] 安全解冻模式
-            # 我们希望解冻每个分支的最后一层以及相关的门控/分类层，但不同网络结构的命名可能不同
-            # 这里使用 hasattr 进行安全检查，有的层就解冻，没有的就跳过
-            # 🟢 [半冻结逻辑] 安全解冻模式 (增加 Layer 4 缓解灾难性遗忘)
-            modules_to_unfreeze = [
-                'branch1_l5', 'branch2_l5', 'branch3_l5',  # 分支最后一层
-                'branch1_l4', 'branch2_l4', 'branch3_l4',  # 🚨 新增：解冻倒数第二层，提供更大容量
-                'gate_l5', 'gate',
-                'bacl1', 'bacl2', 'bacl3',
-                'classifier1', 'classifier2', 'classifier3'
-            ]
-
-            for mod_name in modules_to_unfreeze:
-                if hasattr(self.backbone, mod_name):
-                    module = getattr(self.backbone, mod_name)
-                    for param in module.parameters():
-                        param.requires_grad = True
+        # 仅解冻每个分支的最后两层 (l4/l5) 和 gate/bacl/classifier
+        modules_to_unfreeze = [
+            'branch1_l5', 'branch2_l5', 'branch3_l5',
+            'branch1_l4', 'branch2_l4', 'branch3_l4',
+            'gate_l5', 'gate',
+            'bacl1', 'bacl2', 'bacl3',
+            'classifier1', 'classifier2', 'classifier3'
+        ]
+        for mod_name in modules_to_unfreeze:
+            if hasattr(self.backbone, mod_name):
+                module = getattr(self.backbone, mod_name)
+                for param in module.parameters():
+                    param.requires_grad = True
 
     def _load_osr_weights(self, path):
         print(f"🔄 Loading weights: {path}")
@@ -100,8 +93,19 @@ class NCDWrapper(nn.Module):
             checkpoint = torch.load(path, map_location='cpu')
             state_dict = checkpoint.get('net', checkpoint.get('state_dict', checkpoint))
             new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            self.backbone.load_state_dict(new_state_dict, strict=False)
-            print("✅ Weights loaded.")
+            model_sd = self.backbone.state_dict()
+            compatible = {
+                k: v for k, v in new_state_dict.items()
+                if k in model_sd and tuple(v.shape) == tuple(model_sd[k].shape)
+            }
+            skipped = [
+                k for k, v in new_state_dict.items()
+                if k in model_sd and tuple(v.shape) != tuple(model_sd[k].shape)
+            ]
+            missing, unexpected = self.backbone.load_state_dict(compatible, strict=False)
+            print(f"✅ Weights loaded. compatible={len(compatible)} skipped_shape={len(skipped)}")
+            if skipped:
+                print(f"   ⚠️ Shape-skipped sample: {skipped[:5]}")
         except Exception as e:
             print(f"❌ Error loading weights: {e}")
 
@@ -143,8 +147,7 @@ class NCDWrapper(nn.Module):
 
         return logits, adapted_feats
 
-    def forward_experts(self, x, use_strong_head=False): # 🚀 必须加上这个参数！
-        outputs = self.backbone(x)
+    def forward_experts(self, x, use_strong_head=False):
         """
         专门为主动学习 DDEUS 策略设计：
         不融合特征，让3个分支独立穿过 Adapter 和 DINOHead，输出3个独立的预测。

@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +8,27 @@ from torch.nn import init
 def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, padding=0, bias=False)
+
+
+# ==========================================
+# [组件] BranchSE: 轻量通道注意力 (替代 BACL)
+# 每个 branch 独立学习 channel 重要性权重 → 自然形成 channel-level 多样性
+# ==========================================
+class BranchSE(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        w = x.mean(dim=[2, 3])                         # [B, C] global avg pool
+        w = self.fc(w).unsqueeze(-1).unsqueeze(-1)     # [B, C, 1, 1]
+        return x * w
 
 
 # ==========================================
@@ -77,17 +98,21 @@ class ODLLoss(nn.Module):
         device = x.device
         batch_size = x.size(0)
 
-        distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
-                  torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
-        distmat.addmm_(1, -2, x, self.centers.t())
+        # 输入 x 已经过 F.normalize（单位球），Centers 投影到同一球面保证距离有界 [0,4]
+        # 原始代码用 randn 初始化的 centers 范数 ≈ sqrt(512)≈22，导致距离≈513，
+        # 被 clamp(max=100) 全部截断，梯度归零，ODL 无法学习
+        c = F.normalize(self.centers, p=2, dim=1)  # [K, D]，单位范数，梯度仍流回 self.centers
 
-        self.distcenter = torch.cdist(self.centers, self.centers, p=2) ** 2
+        distmat = (torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) +
+                   torch.pow(c, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+                   - 2.0 * x.mm(c.t()))
+
+        self.distcenter = torch.cdist(c, c, p=2) ** 2
         dist_2center, index_2center = torch.sort(self.distcenter)
         nearest_center_dis = dist_2center[:, 1]
         nearest_center_index = index_2center[:, 1]
 
-        dir_c2c = torch.sub(self.centers.unsqueeze(1).expand(self.num_classes, self.num_classes, self.feat_dim),
-                            self.centers)
+        dir_c2c = torch.sub(c.unsqueeze(1).expand(self.num_classes, self.num_classes, self.feat_dim), c)
 
         inter_cos = torch.tensor(0.).to(device)
         for i in range(self.num_classes):
@@ -113,16 +138,17 @@ class ODLLoss(nn.Module):
         neighbor_dist = torch.masked_select(distmat, no_mask).view(batch_size, -1)
         dis_weight = torch.softmax(-neighbor_dist, dim=1)
 
-        centers_exp = self.centers.unsqueeze(0).expand(batch_size, self.num_classes, self.feat_dim)
+        centers_exp = c.unsqueeze(0).expand(batch_size, self.num_classes, self.feat_dim)
         samples_exp = x.unsqueeze(1).expand(batch_size, self.num_classes, self.feat_dim)
         dir_s2cs = torch.sub(centers_exp, samples_exp)
         dir_s2other = dir_s2cs[no_mask].view(batch_size, -1, self.feat_dim)
         dir_s2c = dir_s2cs[mask].unsqueeze(1).expand(batch_size, -1, self.feat_dim)
         cosine_dir = torch.cosine_similarity(dir_s2c, dir_s2other, dim=2)
 
-        loss_repel = torch.clamp(self.margin - nearest_center_dis, 1e-12, 1e+12).sum() / self.num_classes
+        # 归一化后距离在 [0, 4]，clamp max=4.5 即可，梯度完全流通
+        loss_repel = torch.clamp(self.margin - nearest_center_dis, 1e-12, 10.0).sum() / self.num_classes
         loss_direction = ((1 - cosine_dir) * dis_weight).sum() / batch_size
-        loss_center = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
+        loss_center = dist.clamp(min=1e-12, max=4.5).sum() / batch_size
 
         loss = loss_center + loss_direction + 0.1 * (loss_repel + inter_cos)
         return loss
@@ -157,13 +183,20 @@ class BasicBlock(nn.Module):
 
 class ResNet(nn.Module):
     def __init__(self, block=BasicBlock, num_block=[2, 2, 2, 2], avg_output=False, output_dim=-1, resprestride=1,
-                 res1ststride=1, res2ndstride=1, inchan=3):
+                 res1ststride=1, res2ndstride=1, inchan=3, stem_type='cifar'):
         super().__init__()
         img_chan = inchan
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(img_chan, 64, kernel_size=3, padding=1, bias=False, stride=resprestride),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU())
+        if stem_type == 'imagenet':
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(img_chan, 64, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(64),
+                nn.LeakyReLU(),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+        else:
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(img_chan, 64, kernel_size=3, padding=1, bias=False, stride=resprestride),
+                nn.BatchNorm2d(64),
+                nn.LeakyReLU())
         self.in_channels = 64
         self.conv2_x = self._make_layer(block, 64, num_block[0], res1ststride)
         self.conv3_x = self._make_layer(block, 128, num_block[1], res2ndstride)
@@ -206,13 +239,13 @@ class ResNet(nn.Module):
         return output
 
 
-def build_backbone(img_size, backbone_name, projection_dim, inchan=3):
+def build_backbone(img_size, backbone_name, projection_dim, inchan=3, stem_type='cifar'):
     if backbone_name == 'resnet18':
-        backbone = ResNet(output_dim=projection_dim, inchan=inchan, resprestride=1, res1ststride=1, res2ndstride=2)
-        cam_size = int(img_size / 8)
+        backbone = ResNet(output_dim=projection_dim, inchan=inchan, resprestride=1, res1ststride=1, res2ndstride=2, stem_type=stem_type)
+        cam_size = int(img_size / (32 if stem_type == 'imagenet' else 8))
     elif backbone_name == 'resnet34':
         backbone = ResNet(output_dim=projection_dim, inchan=inchan, num_block=[3, 4, 6, 3], resprestride=1,
-                          res1ststride=2, res2ndstride=2)
+                          res1ststride=2, res2ndstride=2, stem_type=stem_type)
         cam_size = int(img_size / 32)
     else:
         raise Exception(f'Backbone \"{backbone_name}\" is not defined.')
@@ -225,7 +258,7 @@ class BaselineNet(nn.Module):
         backbone, feature_dim, _ = build_backbone(img_size=args['img_size'],
                                                   backbone_name=args['backbone'],
                                                   projection_dim=-1,
-                                                  inchan=3)
+                                                              inchan=3, stem_type=args.get('stem_type', 'cifar'))
         self.backbone = nn.Sequential(*list(backbone.children())[:-2])
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.classifier = conv1x1(feature_dim, args['num_known'])
@@ -268,16 +301,25 @@ class MultiBranchNet(nn.Module):
         backbone, feature_dim, self.cam_size = build_backbone(img_size=args['img_size'],
                                                               backbone_name=args['backbone'],
                                                               projection_dim=-1,
-                                                              inchan=3)
-        self.img_size = args['img_size']
+                                                              inchan=3, stem_type=args.get('stem_type', 'cifar'))
+        self.img_size  = args['img_size']
         self.gate_temp = args['gate_temp']
         self.num_known = args['num_known']
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.avg_pool  = nn.AdaptiveAvgPool2d(1)
+        self.use_bacl  = args.get('use_bacl', False)
+        self.use_odl   = args.get('use_odl',  False)
 
-        self.shared_l3 = nn.Sequential(*list(backbone.children())[:-6])
-
-        self.branch1_l4 = nn.Sequential(*list(backbone.children())[-6:-3])
-        self.branch1_l5 = nn.Sequential(*list(backbone.children())[-3])
+        _ch = list(backbone.children())  # conv1, conv2_x, conv3_x, conv4_x, conv5_x, conv6_x, avg_pool
+        self.legacy_split = args.get('legacy_split', False)
+        if self.legacy_split:
+            # Compatibility with old MEDAF checkpoints such as 0513_2201:
+            # shared_l3=conv1, branch_l4=conv2_x+conv3_x+conv4_x.
+            self.shared_l3 = nn.Sequential(*_ch[:1])
+            self.branch1_l4 = nn.Sequential(*_ch[1:4])
+        else:
+            self.shared_l3 = nn.Sequential(*_ch[:3])    # shared: conv1, conv2_x, conv3_x
+            self.branch1_l4 = nn.Sequential(*_ch[3:4])  # branch-private: conv4_x
+        self.branch1_l5 = nn.Sequential(*_ch[4])
         self.branch1_cls = conv1x1(feature_dim, self.num_known)
 
         self.branch2_l4 = copy.deepcopy(self.branch1_l4)
@@ -288,7 +330,12 @@ class MultiBranchNet(nn.Module):
         self.branch3_l5 = copy.deepcopy(self.branch1_l5)
         self.branch3_cls = conv1x1(feature_dim, self.num_known)
 
-        # VisualBACL Modules
+        # SE channel-attention per branch (lightweight diversity; kept for ablation)
+        self.se1 = BranchSE(feature_dim)
+        self.se2 = BranchSE(feature_dim)
+        self.se3 = BranchSE(feature_dim)
+
+        # VisualBACL kept for ablation experiments (disabled by default via use_bacl=False)
         self.bacl1 = VisualBACL(in_dim=feature_dim, num_confounders=32)
         self.bacl2 = VisualBACL(in_dim=feature_dim, num_confounders=32)
         self.bacl3 = VisualBACL(in_dim=feature_dim, num_confounders=32)
@@ -299,7 +346,26 @@ class MultiBranchNet(nn.Module):
         self.gate_cls = nn.Sequential(Classifier(feature_dim, int(feature_dim / 4), bias=True),
                                       Classifier(int(feature_dim / 4), 3, bias=True))
 
-        self.odl_loss = ODLLoss(num_classes=self.num_known, feat_dim=feature_dim, margin=0.6)
+        self.use_pb_odl = args.get('use_pb_odl', False)
+        # Single ODL instance with shared class centers.
+        # SC-PB-ODL: called once per branch → each branch independently organized
+        # around the SAME class geometry; no conflicting gradients in shared L3.
+        self.odl_loss1 = ODLLoss(num_classes=self.num_known, feat_dim=feature_dim, margin=0.6)
+
+    def set_react_thresholds(self, thresholds):
+        """Enable ReAct clipping with one scalar threshold per expert branch."""
+        self.react_thresholds = [float(t) for t in thresholds]
+
+    def clear_react_thresholds(self):
+        """Disable ReAct clipping. Called before training resumes."""
+        if hasattr(self, 'react_thresholds'):
+            delattr(self, 'react_thresholds')
+
+    def _react_clip(self, x, branch_idx):
+        thresholds = getattr(self, 'react_thresholds', None)
+        if thresholds is None:
+            return x
+        return torch.clamp(x, max=thresholds[branch_idx])
 
     def forward(self, x, y=None, return_ft=False):
         b = x.size(0)
@@ -308,26 +374,29 @@ class MultiBranchNet(nn.Module):
         # --- Branch 1 ---
         branch1_l4 = self.branch1_l4(ft_till_l3.clone())
         branch1_l5 = self.branch1_l5(branch1_l4)
-        branch1_l5_causal = self.bacl1(branch1_l5)  # BACL
-        b1_feat = self.avg_pool(branch1_l5_causal).view(b, -1)
-        b1_ft_cams = self.branch1_cls(branch1_l5_causal)
-        b1_logits = self.avg_pool(b1_ft_cams).view(b, -1)
+        branch1_l5 = self._react_clip(branch1_l5, 0)
+        branch1_out = self.bacl1(branch1_l5) if self.use_bacl else self.se1(branch1_l5)
+        b1_feat    = self.avg_pool(branch1_out).view(b, -1)
+        b1_ft_cams = self.branch1_cls(branch1_out)
+        b1_logits  = self.avg_pool(b1_ft_cams).view(b, -1)
 
         # --- Branch 2 ---
         branch2_l4 = self.branch2_l4(ft_till_l3.clone())
         branch2_l5 = self.branch2_l5(branch2_l4)
-        branch2_l5_causal = self.bacl2(branch2_l5)  # BACL
-        b2_feat = self.avg_pool(branch2_l5_causal).view(b, -1)
-        b2_ft_cams = self.branch2_cls(branch2_l5_causal)
-        b2_logits = self.avg_pool(b2_ft_cams).view(b, -1)
+        branch2_l5 = self._react_clip(branch2_l5, 1)
+        branch2_out = self.bacl2(branch2_l5) if self.use_bacl else self.se2(branch2_l5)
+        b2_feat    = self.avg_pool(branch2_out).view(b, -1)
+        b2_ft_cams = self.branch2_cls(branch2_out)
+        b2_logits  = self.avg_pool(b2_ft_cams).view(b, -1)
 
         # --- Branch 3 ---
         branch3_l4 = self.branch3_l4(ft_till_l3.clone())
         branch3_l5 = self.branch3_l5(branch3_l4)
-        branch3_l5_causal = self.bacl3(branch3_l5)  # BACL
-        b3_feat = self.avg_pool(branch3_l5_causal).view(b, -1)
-        b3_ft_cams = self.branch3_cls(branch3_l5_causal)
-        b3_logits = self.avg_pool(b3_ft_cams).view(b, -1)
+        branch3_l5 = self._react_clip(branch3_l5, 2)
+        branch3_out = self.bacl3(branch3_l5) if self.use_bacl else self.se3(branch3_l5)
+        b3_feat    = self.avg_pool(branch3_out).view(b, -1)
+        b3_ft_cams = self.branch3_cls(branch3_out)
+        b3_logits  = self.avg_pool(b3_ft_cams).view(b, -1)
 
         # --- Gate Calculation (提前到这里) ---
         gate_l5 = self.gate_l5(self.gate_l4(self.gate_l3(x)))
@@ -370,23 +439,34 @@ class MultiBranchNet(nn.Module):
                 outputs['fts'] = fts
 
         # --- ODL Loss ---
-        if y is not None:
-            fused_feat = b1_feat + b2_feat + b3_feat
-            fused_feat = F.normalize(fused_feat, p=2, dim=1)
-            loss_odl = self.odl_loss(fused_feat, y)
-            outputs['loss_odl'] = loss_odl
+        if y is not None and self.use_odl:
+            if self.use_pb_odl:
+                # SC-PB-ODL: shared centers called once per branch.
+                # Each branch independently pulled toward the SAME class geometry;
+                # L3 gradients from all three branches are consistent → stable training.
+                b1n = F.normalize(b1_feat, p=2, dim=1)
+                b2n = F.normalize(b2_feat, p=2, dim=1)
+                b3n = F.normalize(b3_feat, p=2, dim=1)
+                outputs['loss_odl'] = (self.odl_loss1(b1n, y) +
+                                       self.odl_loss1(b2n, y) +
+                                       self.odl_loss1(b3n, y)) / 3
+            else:
+                fused_feat = F.normalize(b1_feat + b2_feat + b3_feat, p=2, dim=1)
+                outputs['loss_odl'] = self.odl_loss1(fused_feat, y)
 
         return outputs
 
     def get_params(self, prefix='extractor'):
-        extractor_params = list(self.shared_l3.parameters()) + \
-                           list(self.branch1_l4.parameters()) + list(self.branch1_l5.parameters()) + \
-                           list(self.branch2_l4.parameters()) + list(self.branch2_l5.parameters()) + \
-                           list(self.branch3_l4.parameters()) + list(self.branch3_l5.parameters()) + \
-                           list(self.gate_l3.parameters()) + list(self.gate_l4.parameters()) + list(
-            self.gate_l5.parameters()) + \
-                           list(self.bacl1.parameters()) + list(self.bacl2.parameters()) + list(
-            self.bacl3.parameters())
+        extractor_params = (list(self.shared_l3.parameters()) +
+                            list(self.branch1_l4.parameters()) + list(self.branch1_l5.parameters()) +
+                            list(self.branch2_l4.parameters()) + list(self.branch2_l5.parameters()) +
+                            list(self.branch3_l4.parameters()) + list(self.branch3_l5.parameters()) +
+                            list(self.gate_l3.parameters()) + list(self.gate_l4.parameters()) +
+                            list(self.gate_l5.parameters()) +
+                            list(self.se1.parameters()) + list(self.se2.parameters()) +
+                            list(self.se3.parameters()) +
+                            list(self.bacl1.parameters()) + list(self.bacl2.parameters()) +
+                            list(self.bacl3.parameters()))
 
         extractor_params_ids = list(map(id, extractor_params))
         classifier_params = filter(lambda p: id(p) not in extractor_params_ids, self.parameters())
