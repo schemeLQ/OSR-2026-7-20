@@ -87,24 +87,6 @@ splits_AUROC = {
 }
 splits_AUROC['cifar_plus'] = splits_AUROC['cifar100']
 
-# CIFAR-100 protocols that pick a random (known, unknown) split instead of
-# using the fixed MEDAF CIFAR+N known/unknown lists above. Keyed by
-# `--cifar100_protocol`; values are (num_known, num_unknown).
-CIFAR100_RANDOM_SPLIT_SIZES = {
-    'random_10_10': (10, 10),
-}
-
-# CIFAR-100 60/40 is a fixed (non-random) split: classes 0-59 known,
-# 60-99 unknown. Same for every item/seed.
-CIFAR100_FIXED_60_40 = (list(range(60)), list(range(60, 100)))
-
-# Folder-name suffix for non-default CIFAR-100 protocols, so their
-# checkpoints never land in (or overwrite) the default cifar100/ folder.
-CIFAR100_PROTOCOL_TAGS = {
-    'random_10_10': '10_10',
-    'fixed_60_40': '60_40',
-}
-
 
 # =================================================================
 # 2. 数据加载器
@@ -397,26 +379,18 @@ def main(options):
             split_plan = [(sid, current_splits[sid])]
             print(f"   [Tiny-ImageNet] Running split_idx={sid}. Use --run_five_splits to run all 5 splits.")
 
-        cifar100_protocol = options.get('cifar100_protocol', 'original_4_96')
         for i, split_def in split_plan:
             options['item'] = i
             total_classes = 100 if options['dataset'] == 'cifar100' else 10
             if 'tiny' in options['dataset']:
                 total_classes = 200
 
-            split_sizes = CIFAR100_RANDOM_SPLIT_SIZES.get(cifar100_protocol)
-            if options['dataset'] == 'cifar100' and cifar100_protocol == 'fixed_60_40':
-                known, unknown = CIFAR100_FIXED_60_40
-                print(f"   [CIFAR100 Split] protocol=fixed_60_40: "
-                      f"60 known (classes 0-59) / 40 unknown (classes 60-99)")
-            elif options['dataset'] == 'cifar100' and split_sizes is not None:
-                n_known, n_unknown = split_sizes
+            if options['dataset'] == 'cifar100' and split_def == 'random_10_10':
                 rng = np.random.default_rng(int(options.get('seed', 0)) + i)
-                selected = rng.choice(total_classes, size=n_known + n_unknown, replace=False).tolist()
-                known = sorted(selected[:n_known])
-                unknown = sorted(selected[n_known:])
-                print(f"   [CIFAR100 Split] protocol={cifar100_protocol}: "
-                      f"{n_known} known / {n_unknown} unknown, seed={options.get('seed', 0)}")
+                selected = rng.choice(total_classes, size=20, replace=False).tolist()
+                known = sorted(selected[:10])
+                unknown = sorted(selected[10:])
+                print(f"   [CIFAR100 Split] Random 10 known / 10 unknown with seed={options.get('seed', 0)}")
                 print(f"   -> Known classes:   {known}")
                 print(f"   -> Unknown classes: {unknown}")
             else:
@@ -427,8 +401,7 @@ def main(options):
             print(f"\n{'=' * 30}\nRunning Split {i + 1}/{len(current_splits)}\n{'=' * 30}")
 
             res = trainLoop(options)
-            protocol_tag = f" protocol={cifar100_protocol}" if options['dataset'] == 'cifar100' else ""
-            stats_log.write(f"SPLIT[{i + 1}]{protocol_tag} => Acc: {res[0]:.3f}, AUROC: {res[1]:.3f}\n")
+            stats_log.write(f"SPLIT[{i + 1}] => Acc: {res[0]:.3f}, AUROC: {res[1]:.3f}\n")
             stats_log.flush()
             # break
 
@@ -513,13 +486,6 @@ def trainLoop(options):
     save_root = f"ckpt/osr/{options['dataset']}"
     if options['dataset'] == 'cifar_plus':
         save_root += f"_plus{options['plus_num']}"
-    elif options['dataset'] == 'cifar100':
-        cifar100_protocol = options.get('cifar100_protocol', 'original_4_96')
-        protocol_tag = CIFAR100_PROTOCOL_TAGS.get(cifar100_protocol)
-        if protocol_tag:
-            # Keep non-default protocols out of the default cifar100/ folder
-            # so they never mix with (or overwrite) the standard 10/10 runs.
-            save_root += f"_{protocol_tag}"
     split_tag = options.get('split_tag', None)
     save_dir = os.path.join(save_root, run_time, split_tag) if split_tag else os.path.join(save_root, run_time)
     ensure_dir(save_dir)
@@ -532,13 +498,6 @@ def trainLoop(options):
         'gate_l3', 'gate_l4', 'gate_l5', 'gate_cls',
         'se1', 'se2', 'se3', 'bacl1', 'bacl2', 'bacl3',
     )
-    # Live objects stashed into `options` for use within this trainLoop call
-    # only (e.g. the CUB val DataLoader/dataset). Never read back from a
-    # reloaded checkpoint, so keep them out of anything we pickle to disk.
-    _LIVE_OPTION_KEYS = ('cub_val_loader', 'cub_data_obj')
-
-    def _picklable_options():
-        return {k: v for k, v in options.items() if k not in _LIVE_OPTION_KEYS}
 
     def _checkpoint_payload(epoch, auroc_val):
         tgt = model.module if isinstance(model, nn.DataParallel) else model
@@ -546,7 +505,7 @@ def trainLoop(options):
             'epoch': epoch,
             'auroc': auroc_val,
             'state_dict': tgt.state_dict(),
-            'options': _picklable_options(),
+            'options': dict(options),
         }
 
     def _save_epoch_ckpt(epoch, auroc_val):
@@ -563,13 +522,7 @@ def trainLoop(options):
         torch.save(payload, os.path.join(save_dir, 'model_best.pth'))
         bb_dict = {k: v for k, v in sd.items()
                    if any(k.startswith(p) for p in _BACKBONE_PREFIXES)}
-        torch.save({
-            'state_dict': bb_dict,
-            'options': _picklable_options(),
-            'source_epoch': epoch,
-            'source_auroc': auroc_val,
-            'source_checkpoint': 'model_best.pth',
-        }, os.path.join(save_dir, 'medaf_backbone_converted.pth'))
+        torch.save(bb_dict, os.path.join(save_dir, 'medaf_backbone_converted.pth'))
         metric_name = 'ValAcc' if options.get('dataset') == 'cub' else 'AUROC'
         print(f"Saved model_best.pth + medaf_backbone_converted.pth  ({metric_name}={auroc_val:.4f})")
 
@@ -641,12 +594,6 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default=None)
     parser.add_argument('--out_dataset', type=str, default=None)
     parser.add_argument('--plus_num', type=int, default=10, help='For CIFAR+N: 10 or 50')  # 新增参数
-    parser.add_argument('--cifar100_protocol', type=str, default='original_4_96',
-                        choices=['original_4_96', 'random_10_10', 'fixed_60_40'],
-                        help="CIFAR-100 known/unknown split: MEDAF's original CIFAR+N known set "
-                             "(original_4_96, 4 known/96 unknown), random 10 known/10 unknown "
-                             "(random_10_10), or fixed 60 known (classes 0-59) / 40 unknown "
-                             "(classes 60-99) (fixed_60_40).")
     parser.add_argument('--split_idx', type=int, default=0, help='Split index for CUB/Tiny-ImageNet: 0..4')
     parser.add_argument('--split_seed', type=int, default=None, help='Independent CUB class split seed; does not change training seed')
     parser.add_argument('--run_five_splits', action='store_true', help='Run all 5 splits for CUB/Tiny-ImageNet')
@@ -684,7 +631,6 @@ if __name__ == '__main__':
     options.update({
         'out_dataset': args.out_dataset,
         'plus_num': args.plus_num,
-        'cifar100_protocol': args.cifar100_protocol,
         'gpu_ids': args.gpu_ids,
         'batch_size': args.batch_size,
         'seed': args.seed if args.seed is not None else options['seed'],

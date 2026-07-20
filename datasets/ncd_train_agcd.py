@@ -5,7 +5,6 @@ import random
 import argparse
 import csv
 import datetime
-import sys
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -44,21 +43,6 @@ def set_seeding(seed):
     torch.backends.cudnn.deterministic = True
 
 
-def _normalize_argv(argv):
-    fixed = []
-    for arg in argv:
-        low = arg.lower()
-        if low.startswith('--ckpt\\') or low.startswith('--ckpt/'):
-            ckpt_value = arg[len('--ckpt'):].lstrip('\\/')
-            ckpt_under_root = os.path.join('ckpt', ckpt_value)
-            if not os.path.exists(ckpt_value) and os.path.exists(ckpt_under_root):
-                ckpt_value = ckpt_under_root
-            fixed.extend(['--ckpt', ckpt_value])
-        else:
-            fixed.append(arg)
-    return fixed
-
-
 def _harmonic_mean(values, eps=1e-12):
     values = np.asarray(values, dtype=np.float64)
     if np.any(values <= 0):
@@ -66,180 +50,10 @@ def _harmonic_mean(values, eps=1e-12):
     return float(len(values) / np.sum(1.0 / (values + eps)))
 
 
-def make_route_buffers(pool_size):
-    """Fresh per-round accumulation buffers for the OT routing loop.
-    Must be recreated every round — never carry mass across rounds."""
-    return {
-        'pseudo_sum': torch.zeros(pool_size),
-        'query_sum': torch.zeros(pool_size),
-        'reject_sum': torch.zeros(pool_size),
-        'query_value_sum': torch.zeros(pool_size),      # legacy V^q, kept for diagnostics only
-        'reject_value_sum': torch.zeros(pool_size),      # legacy V^r, kept for diagnostics only
-        'max_soft_sum': torch.zeros(pool_size),
-        'novelty_sum': torch.zeros(pool_size),
-        'query_active_value_sum': torch.zeros(pool_size),
-        'count': torch.zeros(pool_size),
-    }
-
-
-def route_accumulate_batch(buffers, u_idxs, pseudo_prob, query_prob, reject_prob,
-                            query_value, reject_value, max_soft_target,
-                            novelty, query_active_value):
-    """Accumulate one unlabeled batch's paired-view routing signals by absolute
-    dataset index, in place.
-
-    Args:
-        buffers: dict from make_route_buffers(), updated in place.
-        u_idxs: [B] absolute dataset indices for this batch (from the unlabeled
-            DataLoader's ActiveDataHandler.original_indices).
-        pseudo_prob, query_prob, reject_prob, query_value, reject_value,
-            max_soft_target, novelty, query_active_value: [2B] tensors stacked
-            as [view1(B), view2(B)] — same convention as u_inputs = cat([view1,
-            view2]) — as returned by QAP2OTSolver.get_targets(return_routing=True).
-    """
-    bs = u_idxs.numel()
-    u_idxs_cpu = u_idxs.detach().cpu().long()
-
-    def _view_avg(x):
-        return (0.5 * (x[:bs] + x[bs:])).detach().cpu()
-
-    buffers['pseudo_sum'][u_idxs_cpu] += _view_avg(pseudo_prob)
-    buffers['query_sum'][u_idxs_cpu] += _view_avg(query_prob)
-    buffers['reject_sum'][u_idxs_cpu] += _view_avg(reject_prob)
-    buffers['query_value_sum'][u_idxs_cpu] += _view_avg(query_value)
-    buffers['reject_value_sum'][u_idxs_cpu] += _view_avg(reject_value)
-    buffers['max_soft_sum'][u_idxs_cpu] += _view_avg(max_soft_target)
-    buffers['novelty_sum'][u_idxs_cpu] += _view_avg(novelty)
-    buffers['query_active_value_sum'][u_idxs_cpu] += _view_avg(query_active_value)
-    buffers['count'][u_idxs_cpu] += 1.0
-
-
-def route_finalize_scores(buffers, round_idx, route_round0_fallback, unlabeled_count=None):
-    """Turn a round's accumulated buffers into the stable-anchor / boundary-info
-    dual query scores + debug stats.
-
-    "Not fit for pseudo-labeling" is not the same question as "worth
-    querying" (a low-density sample may be a tail/not-yet-clustered novel
-    class rather than noise), so the two are kept on separate axes instead of
-    ranking pseudo -> query -> reject off one OT-derived score:
-
-        P_i = pseudo_prob  — can this sample be reliably auto-learned right
-            now (row-averaged real-class transport mass / p).
-        H_i = 1 - P_i      — deferred/unmatched mass, derived directly from
-            the OT row marginal, so it is correct whether the OT ran in
-            two-way or three-way mode.
-            This is NOT "this sample is noise" — only "not reliable this round".
-        Q_i = query_active_value — independent active-query value (novelty
-            vs. known heads * density support * aug consistency * mixed
-            expert-disagreement/prediction-uncertainty), computed in
-            ncd_ot.get_targets() *without* reading the OT's query/reject
-            columns, since those conflate low density with "reject-worthy"
-            when here it more often means "tail/unclustered novel class".
-
-        anchor_score_i = P_i * max_k(y_ik)_i
-        info_score_i   = H_i * Q_i                          (round >= 1, or
-                                                               round 0 + query_pass)
-        info_score_i   = Q_i                                 (round 0, default
-                                                               query_value fallback:
-                                                               H_i≈0 uniformly
-                                                               at round 0 since
-                                                               rho_novel=1.0 is
-                                                               forced, so gating
-                                                               by it is uninformative)
-
-    Returns:
-        anchor_score, info_score: [pool_size] tensors. Samples never covered
-            by the collection window fall back to the mean score among
-            covered samples (never silently pinned at 0).
-        debug: dict with q_prob_score/r_prob_score/coverage_ratio/n_covered/
-            uncovered_count/fallback_mode for logging.
-    """
-    count = buffers['count']
-    covered = count > 0
-    n_covered = int(covered.sum().item())
-    denom = unlabeled_count if unlabeled_count is not None else max(1, count.numel())
-    coverage_ratio = n_covered / max(1, denom)
-    safe_count = count.clamp_min(1)
-    p_score = buffers['pseudo_sum'] / safe_count
-    q_prob_score = buffers['query_sum'] / safe_count
-    r_prob_score = buffers['reject_sum'] / safe_count
-    max_soft_score = buffers['max_soft_sum'] / safe_count
-    query_active_score = buffers['query_active_value_sum'] / safe_count
-
-    anchor_score = p_score * max_soft_score
-    # The mode-independent definition is H_i = 1 - P_i. In two-way mode the
-    # legacy r_prob slot contains virtual/defer mass; in three-way mode q+r is
-    # defer mass. Deriving H from P avoids leaking those mode-specific names
-    # into the actual acquisition score and enforces the row-marginal identity.
-    h_score = (1.0 - p_score).clamp(0.0, 1.0)
-
-    if round_idx == 0 and route_round0_fallback == 'query_value':
-        info_score = query_active_score
-        fallback_mode = 'query_value'
-    elif round_idx == 0:
-        info_score = h_score * query_active_score
-        fallback_mode = 'query_pass'
-    else:
-        info_score = h_score * query_active_score
-        fallback_mode = 'h_gated'
-
-    # count is pool-sized and therefore includes the intentionally unobserved
-    # labeled prefix. Report uncovered *unlabeled* samples, not all zero-count
-    # entries in the full dataset buffer.
-    uncovered_count = max(0, int(denom - n_covered))
-    if uncovered_count > 0:
-        anchor_fallback = anchor_score[covered].mean() if n_covered > 0 else torch.tensor(0.0)
-        info_fallback = info_score[covered].mean() if n_covered > 0 else torch.tensor(0.0)
-        anchor_score = anchor_score.clone()
-        info_score = info_score.clone()
-        anchor_score[~covered] = anchor_fallback
-        info_score[~covered] = info_fallback
-
-    debug = {
-        'q_prob_score': q_prob_score,
-        'r_prob_score': r_prob_score,
-        'h_score': h_score,
-        'query_active_score': query_active_score,
-        'coverage_ratio': coverage_ratio,
-        'n_covered': n_covered,
-        'uncovered_count': uncovered_count,
-        'fallback_mode': fallback_mode,
-    }
-    return anchor_score, info_score, debug
-
-
-def parse_anchor_ratio_schedule(spec):
-    """Parse '--route_anchor_ratio_schedule' ("0.7,0.5,0.3,0.2,0.15") into a
-    tuple of floats in [0, 1]. Falls back to the default schedule on empty
-    input; raises on malformed input rather than silently ignoring a typo."""
-    default = (0.70, 0.50, 0.30, 0.20, 0.15)
-    if spec is None or not str(spec).strip():
-        return default
-    values = tuple(float(x) for x in str(spec).split(','))
-    if len(values) == 0 or any(v < 0.0 or v > 1.0 for v in values):
-        raise ValueError(f"--route_anchor_ratio_schedule must be comma-separated ratios in [0,1], got: {spec}")
-    return values
-
-
-def anchor_ratio_for_round(schedule, round_idx):
-    """Clamp to the last scheduled ratio once round_idx exceeds the schedule
-    (so --al_rounds > len(schedule) degrades gracefully instead of crashing)."""
-    idx = min(max(int(round_idx), 0), len(schedule) - 1)
-    return float(schedule[idx])
-
-
 def make_ncd_save_dir(args):
     run_time = datetime.datetime.now().strftime("%m%d_%H%M")
     save_root = getattr(args, 'save_root', './ckpt/ncd_al')
-    dataset_tag = str(args.dataset).lower()
-    if dataset_tag == 'cifar100':
-        cifar100_protocol = getattr(args, 'cifar100_protocol', 'original_4_96')
-        protocol_tag = _CIFAR100_PROTOCOL_TAGS.get(cifar100_protocol)
-        if protocol_tag:
-            # Keep non-default protocols (e.g. 60/40) out of the default
-            # cifar100/ folder so they never mix with the standard 10/10 runs.
-            dataset_tag += f"_{protocol_tag}"
-    save_dir = os.path.join(save_root, dataset_tag, run_time)
+    save_dir = os.path.join(save_root, str(args.dataset).lower(), run_time)
     os.makedirs(save_dir, exist_ok=True)
     args.run_time = run_time
     args.save_dir = save_dir
@@ -292,8 +106,6 @@ def write_ncd_summary(save_dir, all_results, args, aosdq=None):
         f.write('NCD Active Discovery Summary\n')
         f.write('=' * 96 + '\n')
         f.write(f'dataset={args.dataset}\n')
-        if str(args.dataset).lower() == 'cifar100':
-            f.write(f'cifar100_protocol={getattr(args, "cifar100_protocol", "auto")}\n')
         f.write(f'known={getattr(args, "known", [])}\n')
         f.write(f'unknown={getattr(args, "unknown", [])}\n')
         f.write(f'query_size={args.query_size}, al_rounds={args.al_rounds}, epochs_per_round={args.epochs_per_round}\n')
@@ -362,24 +174,13 @@ def infer_dataset_from_ckpt_path(ckpt_path):
 
 
 def load_ckpt_options(ckpt_path):
-    if not ckpt_path:
+    if not ckpt_path or not os.path.exists(ckpt_path):
         return {}
-    candidate_paths = [ckpt_path]
-    ckpt_name = os.path.basename(str(ckpt_path)).lower()
-    if ckpt_name == 'medaf_backbone_converted.pth':
-        candidate_paths.insert(0, os.path.join(os.path.dirname(ckpt_path), 'model_best.pth'))
-    for path in candidate_paths:
-        if not path or not os.path.exists(path):
-            continue
-        try:
-            ckpt = torch.load(path, map_location='cpu')
-            if isinstance(ckpt, dict) and isinstance(ckpt.get('options'), dict):
-                if path != ckpt_path:
-                    print(f"   [Protocol] loaded split metadata from sibling checkpoint: {path}")
-                return dict(ckpt['options'])
-        except Exception:
-            continue
-    return {}
+    try:
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        return dict(ckpt.get('options', {})) if isinstance(ckpt, dict) else {}
+    except Exception:
+        return {}
 
 
 def _select_remap(data, targets, classes, offset=0):
@@ -395,55 +196,13 @@ def _tiny_data(root, split):
     return ds.memory_data.cpu().numpy(), ds.memory_targets.cpu().numpy()
 
 
-# CIFAR-100 protocols that pick a random (known, unknown) split instead of
-# using the fixed MEDAF CIFAR+N known/unknown lists. Keyed by
-# `--cifar100_protocol`; values are (num_known, num_unknown). Must match
-# CIFAR100_RANDOM_SPLIT_SIZES in osr_main.py so a checkpoint trained there
-# and an NCD run without saved known/unknown metadata agree on the split.
-_CIFAR100_RANDOM_SPLIT_SIZES = {
-    'random_10_10': (10, 10),
-}
-
-# CIFAR-100 60/40 is a fixed (non-random) split: classes 0-59 known,
-# 60-99 unknown, same for every item/seed. Must match CIFAR100_FIXED_60_40
-# in osr_main.py.
-_CIFAR100_FIXED_60_40 = (list(range(60)), list(range(60, 100)))
-
-# Folder-name suffix for non-default CIFAR-100 protocols, so their
-# checkpoints never land in (or overwrite) the default cifar100/ folder.
-# Must match CIFAR100_PROTOCOL_TAGS in osr_main.py.
-_CIFAR100_PROTOCOL_TAGS = {
-    'random_10_10': '10_10',
-    'fixed_60_40': '60_40',
-}
-
-
-def _cifar100_random_split(seed, item, protocol):
-    n_known, n_unknown = _CIFAR100_RANDOM_SPLIT_SIZES[protocol]
-    rng = np.random.default_rng(int(seed) + int(item))
-    selected = rng.choice(100, size=n_known + n_unknown, replace=False).tolist()
-    return sorted(selected[:n_known]), sorted(selected[n_known:])
-
-
 def _protocol_classes(args, ckpt_options):
     dataset = args.dataset
     item = int(ckpt_options.get('item', getattr(args, 'item', 0)))
     plus_num = int(ckpt_options.get('plus_num', getattr(args, 'plus_num', 10)))
-    cifar100_protocol = str(ckpt_options.get(
-        'cifar100_protocol',
-        getattr(args, 'cifar100_protocol', 'auto')
-    )).lower()
-
-    split_override = None
-    if dataset == 'cifar100' and cifar100_protocol == 'fixed_60_40':
-        split_override = _CIFAR100_FIXED_60_40
-    elif dataset == 'cifar100' and cifar100_protocol in _CIFAR100_RANDOM_SPLIT_SIZES:
-        split_override = _cifar100_random_split(getattr(args, 'seed', 0), item, cifar100_protocol)
 
     if ckpt_options.get('known'):
         known = list(ckpt_options['known'])
-    elif split_override is not None:
-        known = split_override[0]
     elif dataset == 'cifar10':
         known = [0, 1, 2, 4, 5, 9]
     else:
@@ -453,8 +212,6 @@ def _protocol_classes(args, ckpt_options):
 
     if ckpt_options.get('unknown'):
         unknown = list(ckpt_options['unknown'])
-    elif split_override is not None:
-        unknown = split_override[1]
     elif dataset == 'cifar_plus':
         key = f'cifar100-{plus_num}'
         if key in splits_AUROC:
@@ -465,19 +222,6 @@ def _protocol_classes(args, ckpt_options):
     else:
         total = 200 if dataset == 'tiny_imagenet' else (100 if dataset == 'cifar100' else 10)
         unknown = sorted(list(set(range(total)) - set(known)))
-
-    max_unknown = int(getattr(args, 'max_unknown_classes', 0) or 0)
-    if max_unknown > 0 and len(unknown) > max_unknown:
-        unknown = unknown[:max_unknown]
-
-    if dataset == 'cifar100' and cifar100_protocol == 'auto':
-        if len(known) == 4 and len(unknown) == 96:
-            cifar100_protocol = 'original_4_96'
-        elif len(known) == 10 and len(unknown) == 10:
-            cifar100_protocol = 'random_10_10'
-        elif len(known) == 60 and len(unknown) == 40:
-            cifar100_protocol = 'fixed_60_40'
-    args.cifar100_protocol = cifar100_protocol
 
     return known, unknown, item, plus_num
 
@@ -570,8 +314,6 @@ def build_ncd_protocol(args):
     initial_indices = np.where(trainset_base.targets < args.num_known)[0].tolist()
 
     print(f"   [Protocol] dataset={args.dataset} img_size={img_size}")
-    if args.dataset == 'cifar100':
-        print(f"   [Protocol] cifar100_protocol={getattr(args, 'cifar100_protocol', 'auto')}")
     print(f"   [Protocol] known={known}")
     print(f"   [Protocol] unknown={unknown[:20]}{' ...' if len(unknown) > 20 else ''}")
     print(f"   [Protocol] num_known={args.num_known} num_unknown={args.num_unknown_est}")
@@ -596,7 +338,7 @@ def build_ncd_protocol(args):
 
 
 
-def evaluate(model, loader, device, num_known=6, round_idx=0, args=None):
+def evaluate(model, loader, device, num_known=6, round_idx=0):
     model.eval()
     preds, targets = [], []
     novel_preds = []
@@ -626,24 +368,10 @@ def evaluate(model, loader, device, num_known=6, round_idx=0, args=None):
     nmi = normalized_mutual_info_score(targets_np, preds_np) * 100
     ari = adjusted_rand_score(targets_np, preds_np) * 100
 
+    threshold = 0.85 - (round_idx * 0.02)
     actual_known_mask = targets_np < num_known
     actual_unknown_mask = targets_np >= num_known
     total_actual_unknowns = np.sum(actual_unknown_mask)
-
-    fallback_threshold = 0.85 - (round_idx * 0.02)
-    threshold_mode = getattr(args, 'eval_threshold_mode', 'calibrated') if args is not None else 'calibrated'
-    if threshold_mode == 'none':
-        threshold = -1.0
-    elif threshold_mode == 'fixed' or np.sum(actual_known_mask) == 0:
-        threshold = fallback_threshold
-    else:
-        # Calibrate the known/unknown rejection threshold from known validation
-        # confidence, so a low-temperature or under-confident NCD head does not
-        # reject every known sample and report KAcc=0 by construction.
-        reject_rate = float(getattr(args, 'eval_known_reject_rate', 0.05)) if args is not None else 0.05
-        reject_rate = min(max(reject_rate, 0.0), 0.5)
-        threshold = float(np.quantile(max_known_confs_np[actual_known_mask], reject_rate))
-
     pred_unknown_mask = (preds_np >= num_known) | (max_known_confs_np < threshold)
     known_correct_mask = actual_known_mask & (preds_np == targets_np) & (~pred_unknown_mask)
     known_acc = np.sum(known_correct_mask) / np.sum(actual_known_mask) if np.sum(actual_known_mask) > 0 else 0.0
@@ -657,34 +385,6 @@ def evaluate(model, loader, device, num_known=6, round_idx=0, args=None):
         ca = 0.0
     osca = 2 * udr * ca / (udr + ca) * 100 if (udr + ca) > 0 else 0.0
     osdq = _harmonic_mean([known_acc, udr, ca]) * 100
-
-    if bool(getattr(args, 'eval_debug', False)) if args is not None else False:
-        raw_known_acc = (
-            np.mean(preds_np[actual_known_mask] == targets_np[actual_known_mask])
-            if np.sum(actual_known_mask) > 0 else 0.0
-        )
-        known_pred_known_rate = (
-            np.mean(preds_np[actual_known_mask] < num_known)
-            if np.sum(actual_known_mask) > 0 else 0.0
-        )
-        unknown_pred_unknown_rate = (
-            np.mean(preds_np[actual_unknown_mask] >= num_known)
-            if total_actual_unknowns > 0 else 0.0
-        )
-        novel_unique = len(np.unique(novel_preds_np[actual_unknown_mask])) if total_actual_unknowns > 0 else 0
-        pred_values, pred_counts = np.unique(preds_np, return_counts=True)
-        top = sorted(zip(pred_values.tolist(), pred_counts.tolist()), key=lambda x: x[1], reverse=True)[:8]
-        print(
-            f"   [EvalDebug] threshold={threshold:.4f} mode={threshold_mode} "
-            f"rawKAcc={raw_known_acc * 100:.2f}% "
-            f"KPredKnown={known_pred_known_rate * 100:.2f}% "
-            f"UPredNovel={unknown_pred_unknown_rate * 100:.2f}% "
-            f"knownConf(mean/min/max)="
-            f"{max_known_confs_np[actual_known_mask].mean():.3f}/"
-            f"{max_known_confs_np[actual_known_mask].min():.3f}/"
-            f"{max_known_confs_np[actual_known_mask].max():.3f} "
-            f"novelUnique={novel_unique} topPred={top}"
-        )
 
     return acc, nmi, ari, known_acc * 100, udr * 100, ca * 100, osca, osdq
 
@@ -870,7 +570,7 @@ def train_agcd(args):
         eps=args.ot_eps,
         rho_known=1.0,      # 已知类：不过滤（已知类标注多、置信度高）
         rho_novel=args.ot_rho_novel,
-        n_iter=args.ot_n_iter,
+        n_iter=30,          # Sinkhorn 迭代次数（30 次足够 10 类 CIFAR-10）
         alpha=1.0,          # Laplace 平滑，防止新类先验为零
         c_virtual=args.ot_c_virtual,
         query_prior_weight=args.ot_query_prior_weight,
@@ -878,29 +578,18 @@ def train_agcd(args):
         ot_temp=args.ot_temp,
         lambda_dis=args.ot_lambda_dis,
         lambda_u=args.ot_lambda_u,
-        lambda_query=args.ot_lambda_query,
-        lambda_reject=args.ot_lambda_reject,
-        rho_query=args.ot_rho_query,
-        use_al_p2ot=args.use_al_p2ot,
-        use_three_way_transport=args.use_three_way_transport,
-        use_classwise_disagreement=args.use_classwise_disagreement,
-        use_density_score=args.use_density_score,
-        use_aug_consistency=args.use_aug_consistency,
         use_adaptive_rho=args.ot_use_adaptive_rho,
         rho_min=args.ot_rho_min,
         rho_max=args.ot_rho_max,
         rho_beta=args.ot_rho_beta,
         rho_gamma=args.ot_rho_gamma,
-        query_active_lambda=args.query_active_lambda,
-        query_density_floor=args.query_density_floor,
         novel_only_unlabeled=True
     )
     print(f"   [QA-P²OT] OT solver initialized: "
           f"eps={ot_solver.eps}, rho_novel={ot_solver.rho_novel}, "
           f"q_w={ot_solver.query_prior_weight}, prior_floor={ot_solver.prior_floor}, "
           f"temp={ot_solver.ot_temp}, lambda_dis={ot_solver.lambda_dis}, "
-          f"lambda_u={ot_solver.lambda_u}, three_way={ot_solver.use_three_way_transport}, "
-          f"rho_q={ot_solver.rho_query}, adaptive_rho={ot_solver.use_adaptive_rho}, "
+          f"lambda_u={ot_solver.lambda_u}, adaptive_rho={ot_solver.use_adaptive_rho}, "
           f"n_iter={ot_solver.n_iter}")
 
     # EGDB 损失：feat_loss_w=0 关掉特征对齐，只用分类一致性，梯度不流回 backbone
@@ -935,32 +624,10 @@ def train_agcd(args):
     best_osdq = -1.0
     best_osca = -1.0
 
-    # Auto-enable routing-buffer collection whenever the selected strategy
-    # actually consumes it, so picking --strategy TransportRouteSampling
-    # can't silently run with no routing data because --use_transport_route_query
-    # was forgotten.
-    route_query_strategy_names = {'TransportRouteSampling', 'RouteQuery', 'ThreeWayRoute'}
-    route_collect_active = (
-        bool(getattr(args, 'use_transport_route_query', False))
-        or str(getattr(args, 'strategy', '')) in route_query_strategy_names
-    )
-    if route_collect_active:
-        print(f"   [Route Query] routing-buffer collection ENABLED "
-              f"(strategy={args.strategy}, query_active_lambda={args.query_active_lambda}, "
-              f"collect_start_ratio={args.route_collect_start_ratio}, "
-              f"round0_fallback={args.route_round0_fallback})")
-
     for round_idx in range(args.al_rounds + 1):
         print(f"\n======== Round {round_idx} / {args.al_rounds} ========")
 
         skip_training = False
-        # Reset every round (Python has function-, not block-, scope) so a round
-        # that skips training or has routing disabled never reuses a prior
-        # round's stale scores.
-        route_anchor_score = None
-        route_info_score = None
-        route_q_prob_debug = None
-        route_r_prob_debug = None
         if args.resume_round0 and round_idx == 0:
             print(f"   ⏭️ [Resume] 检测到断点参数，直接跳过训练，载入权重: {args.resume_round0}")
             checkpoint = torch.load(args.resume_round0, map_location=device)
@@ -1016,33 +683,13 @@ def train_agcd(args):
             loader_unlabeled = DataLoader(
                 trainset_unlabeled, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-            if route_collect_active and ot_solver.use_three_way_transport:
-                # Tie the OT training column's query budget to the actual active-learning
-                # query budget as a fraction of the current unlabeled pool, instead of a
-                # fixed constant, so rho_query stays meaningful as the pool shrinks/grows.
-                ot_solver.rho_query = args.query_size / max(1, len(trainset_unlabeled))
-                print(f"   [Route Query] dynamic rho_query={ot_solver.rho_query:.4f} "
-                      f"(query_size={args.query_size} / unlabeled_pool={len(trainset_unlabeled)})")
-            elif route_collect_active:
-                print("   [Route Query] two-way OT active: virtual mass is treated as "
-                      "deferred mass; rho_query is unused")
-
-            # ── Route-query buffers: reset every round, never carried over ──
-            # (see get_targets(..., return_routing=True) below). Sized over the
-            # whole pool so absolute dataset indices (u_idxs) can index directly.
-            route_buffers = make_route_buffers(len(trainset_base))
-            route_collect_start_epoch = int(
-                args.epochs_per_round * float(args.route_collect_start_ratio))
-
             for epoch in range(args.epochs_per_round):
                 model.train()
                 loss_meter = []
                 rel_meter = []
                 ot_stat_meter = {
                     'rho': [], 'edis': [], 'eagr': [], 'real': [],
-                    'virt': [], 'wmin': [], 'wmax': [], 'rho_pl': [],
-                    'rho_q': [], 'rho_reject': [], 'density': [],
-                    'aug': [], 'qval': [], 'qmass': [], 'rmass': []
+                    'virt': [], 'wmin': [], 'wmax': []
                 }
                 egdb_fr_list = []
 
@@ -1102,13 +749,6 @@ def train_agcd(args):
                     #   teacher 输出稳定 logits，Sinkhorn 生成软分配，
                     #   先验 q 由当前标注分布决定（已知类权重 >> 新类权重）
                     # ================================================================
-                    bs = u_view1.size(0)
-                    collecting_route = route_collect_active and epoch >= route_collect_start_epoch
-                    round0_query_pass = (
-                        collecting_route and round_idx == 0
-                        and args.route_round0_fallback == 'query_pass'
-                    )
-
                     with torch.no_grad():
                         ot_expert_logits = None
                         if args.ot_lambda_dis > 0 or args.ot_lambda_u > 0 or args.ot_use_adaptive_rho:
@@ -1119,7 +759,7 @@ def train_agcd(args):
                             except Exception as e:
                                 if len(ot_stat_meter['rho']) == 0:
                                     print(f"   ⚠️ [QA-P²OT] Expert logits disabled for OT: {e}")
-                        ot_targets, ot_reliability, ot_routing = ot_solver.get_targets(
+                        ot_targets, ot_reliability = ot_solver.get_targets(
                             student_logits=u_logits.detach(),
                             teacher_model=ema_teacher,
                             u_inputs=u_inputs,
@@ -1130,57 +770,10 @@ def train_agcd(args):
                             epoch=epoch + 1,
                             max_epoch=args.epochs_per_round,
                             expert_logits=ot_expert_logits,
-                            student_features=u_feats.detach(),
-                            dynamic_alignment=dynamic_alignment,
-                            return_reliability=True,
-                            return_routing=True,
+                            return_reliability=True
                         )
 
-                        # ── Route-query buffer accumulation (only in the round's
-                        # collection window; reset every round, see buffer init above) ──
-                        if collecting_route:
-                            if round0_query_pass:
-                                # Round 0 forces rho_novel=1.0 for the *training* targets
-                                # above (real pseudo-label mass), so ot_routing's
-                                # query_prob/reject_prob are near-zero and unusable for
-                                # ranking. Make a routing-only second call with rho_novel
-                                # relaxed to its steady-state value; its soft targets /
-                                # reliability are discarded, never used for loss.
-                                _, _, route_only = ot_solver.get_targets(
-                                    student_logits=u_logits.detach(),
-                                    teacher_model=ema_teacher,
-                                    u_inputs=u_inputs,
-                                    active_dataset=active_dataset,
-                                    all_targets=trainset_base.targets,
-                                    device=device,
-                                    round_idx=round_idx,
-                                    epoch=epoch + 1,
-                                    max_epoch=args.epochs_per_round,
-                                    expert_logits=ot_expert_logits,
-                                    student_features=u_feats.detach(),
-                                    dynamic_alignment=dynamic_alignment,
-                                    rho_novel_override=ot_solver.rho_novel,
-                                    return_reliability=True,
-                                    return_routing=True,
-                                )
-                                q_prob, r_prob = route_only['query_prob'], route_only['reject_prob']
-                            else:
-                                q_prob, r_prob = ot_routing['query_prob'], ot_routing['reject_prob']
-
-                            # pseudo_prob/max_soft_target/novelty/query_active_value always
-                            # come from the main call: P_i≈1 and max_k(y_ik) stay meaningful
-                            # at round 0 too (only query_prob/reject_prob, i.e. H_i, are
-                            # near-zero there), and novelty/query_active_value don't depend
-                            # on rho_novel at all — they're computed before the OT branch
-                            # fork from teacher_logits/expert_logits/density, identical
-                            # whether or not rho_novel_override was used for q_prob/r_prob.
-                            route_accumulate_batch(
-                                route_buffers, u_idxs,
-                                ot_routing['pseudo_prob'], q_prob, r_prob,
-                                ot_routing['query_value'], ot_routing['reject_value'],
-                                ot_routing['max_soft_target'],
-                                ot_routing['novelty'], ot_routing['query_active_value'],
-                            )
+                    bs = u_view1.size(0)
                     log_probs = F.log_softmax(u_logits / 0.1, dim=1)
                     weights_swapped = torch.cat([ot_reliability[bs:], ot_reliability[:bs]], dim=0).detach()
 
@@ -1277,14 +870,6 @@ def train_agcd(args):
                         ot_stat_meter['virt'].append(ot_stats.get('virtual_mass', 0.0))
                         ot_stat_meter['wmin'].append(ot_stats.get('weight_min', 0.0))
                         ot_stat_meter['wmax'].append(ot_stats.get('weight_max', 0.0))
-                        ot_stat_meter['rho_pl'].append(ot_stats.get('rho_pl', 0.0))
-                        ot_stat_meter['rho_q'].append(ot_stats.get('rho_q', 0.0))
-                        ot_stat_meter['rho_reject'].append(ot_stats.get('rho_reject', 0.0))
-                        ot_stat_meter['density'].append(ot_stats.get('density', 1.0))
-                        ot_stat_meter['aug'].append(ot_stats.get('aug_consistency', 1.0))
-                        ot_stat_meter['qval'].append(ot_stats.get('query_value', 0.0))
-                        ot_stat_meter['qmass'].append(ot_stats.get('query_mass', 0.0))
-                        ot_stat_meter['rmass'].append(ot_stats.get('reject_mass', 0.0))
                     postfix = {'L': f"{np.mean(loss_meter):.3f}"}
                     postfix['rel'] = f"{np.mean(rel_meter):.2f}"
                     if ot_stat_meter['rho']:
@@ -1301,15 +886,7 @@ def train_agcd(args):
                         f"edis={np.mean(ot_stat_meter['edis']):.6f} "
                         f"eagr={np.mean(ot_stat_meter['eagr']):.4f} "
                         f"real_mass={np.mean(ot_stat_meter['real']):.6f} "
-                        f"query_mass={np.mean(ot_stat_meter['qmass']):.6f} "
-                        f"reject_mass={np.mean(ot_stat_meter['rmass']):.6f} "
                         f"virtual_mass={np.mean(ot_stat_meter['virt']):.6f} "
-                        f"rho_pl={np.mean(ot_stat_meter['rho_pl']):.4f} "
-                        f"rho_q={np.mean(ot_stat_meter['rho_q']):.4f} "
-                        f"rho_rej={np.mean(ot_stat_meter['rho_reject']):.4f} "
-                        f"dens={np.mean(ot_stat_meter['density']):.4f} "
-                        f"aug={np.mean(ot_stat_meter['aug']):.4f} "
-                        f"qval={np.mean(ot_stat_meter['qval']):.4f} "
                         f"w={np.mean(rel_meter):.4f} "
                         f"w_min={np.mean(ot_stat_meter['wmin']):.4f} "
                         f"w_max={np.mean(ot_stat_meter['wmax']):.4f} "
@@ -1318,45 +895,8 @@ def train_agcd(args):
 
                 scheduler.step()
 
-            if route_collect_active:
-                unlabeled_count = int((~active_dataset.labeled_mask).sum())
-                route_anchor_score, route_info_score, route_debug = route_finalize_scores(
-                    route_buffers, round_idx, args.route_round0_fallback,
-                    unlabeled_count=unlabeled_count,
-                )
-                route_q_prob_debug = route_debug['q_prob_score']
-                route_r_prob_debug = route_debug['r_prob_score']
-                covered = route_buffers['count'] > 0
-                if route_debug['n_covered'] > 0:
-                    q_mean = route_q_prob_debug[covered].mean().item()
-                    q_min = route_q_prob_debug[covered].min().item()
-                    q_max = route_q_prob_debug[covered].max().item()
-                    r_mean = route_r_prob_debug[covered].mean().item()
-                    r_min = route_r_prob_debug[covered].min().item()
-                    r_max = route_r_prob_debug[covered].max().item()
-                    h_mean = route_debug['h_score'][covered].mean().item()
-                    qav_mean = route_debug['query_active_score'][covered].mean().item()
-                    anchor_mean = route_anchor_score[covered].mean().item()
-                    info_mean = route_info_score[covered].mean().item()
-                else:
-                    q_mean = q_min = q_max = r_mean = r_min = r_max = 0.0
-                    h_mean = qav_mean = anchor_mean = info_mean = 0.0
-                anchor_ratio_schedule = parse_anchor_ratio_schedule(args.route_anchor_ratio_schedule)
-                anchor_ratio_this_round = anchor_ratio_for_round(anchor_ratio_schedule, round_idx)
-                print(
-                    f"   [Route Query] round={round_idx} mode={route_debug['fallback_mode']} "
-                    f"anchor_ratio={anchor_ratio_this_round:.2f} "
-                    f"coverage={route_debug['coverage_ratio'] * 100:.1f}% "
-                    f"(uncovered={route_debug['uncovered_count']}) "
-                    f"q_prob(mean/min/max)={q_mean:.4f}/{q_min:.4f}/{q_max:.4f} "
-                    f"{'reject' if ot_solver.use_three_way_transport else 'defer'}_prob(mean/min/max)="
-                    f"{r_mean:.4f}/{r_min:.4f}/{r_max:.4f} "
-                    f"H(mean)={h_mean:.4f} Q_active(mean)={qav_mean:.4f} "
-                    f"anchor_score(mean)={anchor_mean:.4f} info_score(mean)={info_mean:.4f}"
-                )
-
         acc, nmi, ari, known_acc, udr, ca, osca, osdq = evaluate(
-            model, loader_test, device, args.num_known, round_idx=round_idx, args=args)
+            model, loader_test, device, args.num_known, round_idx=round_idx)
         metrics = {
             'acc': acc, 'nmi': nmi, 'ari': ari, 'known_acc': known_acc,
             'udr': udr, 'ca': ca, 'osca': osca, 'osdq': osdq,
@@ -1398,34 +938,14 @@ def train_agcd(args):
 
             # 🚀 统一调用：无论什么策略，都把需要的 Round 信息传进去
             # 如果策略本身不需要这些参数，由于我们定义了 **kwargs，它会自动忽略
-            # (EntropySampling/RandomSampling don't take **kwargs at all, so
-            # anchor_score/info_score are only added to the call when they
-            # actually have data, instead of relying on every strategy
-            # accepting arbitrary kwargs).
-            query_kwargs = {}
-            if route_anchor_score is not None and route_info_score is not None:
-                query_kwargs['anchor_score'] = route_anchor_score
-                query_kwargs['info_score'] = route_info_score
-                query_kwargs['anchor_ratio_schedule'] = parse_anchor_ratio_schedule(
-                    args.route_anchor_ratio_schedule)
             query_idxs = strategy_instance.query(
                 args.query_size,
                 current_round=round_idx,
-                adaptive_round=2,
-                **query_kwargs,
+                adaptive_round=2
             )
 
             active_dataset.update_labels(query_idxs)
             print(f"   ✅ [Active Learning] 成功查询并标注 {len(query_idxs)} 个高价值样本！")
-
-            if route_q_prob_debug is not None and len(query_idxs) > 0:
-                q_idxs_t = torch.as_tensor(query_idxs, dtype=torch.long)
-                print(
-                    f"   [Route Query] queried-set q_prob(mean)={route_q_prob_debug[q_idxs_t].mean().item():.4f} "
-                    f"vs pool q_prob(mean)={route_q_prob_debug.mean().item():.4f} | "
-                    f"queried-set r_prob(mean)={route_r_prob_debug[q_idxs_t].mean().item():.4f} "
-                    f"vs pool r_prob(mean)={route_r_prob_debug.mean().item():.4f}"
-                )
 
             print(f"   🔄 [Label Alignment] 正在使用全量有标签数据更新全局神经元映射...")
             all_labeled_dataset = active_dataset.get_labeled_dataset(transform=test_transform)
@@ -1467,21 +987,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='auto',
                         help='auto/cifar10/cifar_plus/cifar100/tiny_imagenet')
     parser.add_argument('--item', type=int, default=0, help='Open-set split index if ckpt has no saved options.')
-    parser.add_argument('--split_idx', type=int, dest='item',
-                        help='Alias of --item, matching osr_main.py.')
     parser.add_argument('--plus_num', type=int, default=10, help='For cifar_plus: number of CIFAR100 unknown classes.')
-    parser.add_argument('--cifar100_protocol', type=str, default='auto',
-                        choices=['auto', 'original_4_96', 'random_10_10', 'fixed_60_40'],
-                        help='CIFAR-100 fallback protocol when ckpt has no known/unknown metadata.')
-    parser.add_argument('--max_unknown_classes', type=int, default=0,
-                        help='Optional cap for unknown classes in NCD. Use 20 for Tiny-ImageNet 20-known/20-unknown debugging.')
-    parser.add_argument('--eval_threshold_mode', type=str, default='calibrated',
-                        choices=['calibrated', 'fixed', 'none'],
-                        help='How to threshold known confidence for UDR/KAcc metrics.')
-    parser.add_argument('--eval_known_reject_rate', type=float, default=0.05,
-                        help='For calibrated eval threshold, reject this fraction of known validation samples.')
-    parser.add_argument('--eval_debug', action='store_true',
-                        help='Print prediction/confidence diagnostics after each evaluation.')
     parser.add_argument('--num_known', type=int, default=6)
     parser.add_argument('--num_unknown_est', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=128)
@@ -1497,52 +1003,6 @@ if __name__ == '__main__':
                         help='BoundaryMarginJSSampling 中低 margin 不确定性的权重')
     parser.add_argument('--query_stable_ratio', type=float, default=0.7,
                         help='BoundaryMarginJSSampling 中 stable anchor 查询比例')
-    parser.add_argument('--query_density_k', type=int, default=10,
-                        help='ALP2OTSampling kNN density neighbor count.')
-    parser.add_argument('--query_density_ref', type=int, default=4096,
-                        help='ALP2OTSampling max reference features for chunked density.')
-    parser.add_argument('--query_sinkhorn_iter', type=int, default=30,
-                        help='ALP2OTSampling Sinkhorn iterations.')
-    parser.add_argument('--query_transport_weight', type=float, default=0.7,
-                        help='Weight of T_query/p in ALP2OTSampling final score.')
-    parser.add_argument('--query_reject_penalty', type=float, default=0.2,
-                        help='Penalty weight of T_reject/p in ALP2OTSampling final score.')
-    parser.add_argument('--use_transport_route_query', action='store_true', default=False,
-                        help='Connect training OT reliability/deferred mass to active query '
-                             'selection by accumulating per-sample routing signals across '
-                             'the round. Supports both two-way and three-way OT. Auto-enabled '
-                             'when --strategy is TransportRouteSampling.')
-    parser.add_argument('--route_collect_start_ratio', type=float, default=0.5,
-                        help='Only accumulate routing scores from the last '
-                             '(1 - ratio) fraction of a round\'s epochs, so early, '
-                             'less-converged epochs do not dilute the round-end ranking.')
-    parser.add_argument('--route_round0_fallback', type=str, default='query_value',
-                        choices=['query_value', 'query_pass'],
-                        help='Round 0 forces rho_novel=1.0, so deferred OT mass is near zero '
-                             'and unusable for ranking. "query_value" ranks by the independent '
-                             'active-query value Q_i instead. "query_pass" makes an extra per-batch '
-                             'get_targets() call with rho_novel temporarily relaxed (routing '
-                             'only, never used for the actual round-0 training targets) to '
-                             'get non-degenerate deferred mass.')
-    parser.add_argument('--route_anchor_ratio_schedule', type=str, default='0.70,0.50,0.30,0.20,0.15',
-                        help='Comma-separated per-round stable-anchor budget ratio for '
-                             'TransportRouteSampling (round_idx clamps to the last value '
-                             'once --al_rounds exceeds the schedule length). Early rounds '
-                             'favor stable anchors to seed novel clusters and the Hungarian '
-                             'mapping; later rounds shift toward boundary/informative samples.')
-    parser.add_argument('--query_active_lambda', type=float, default=0.5,
-                        help='Mixing weight lambda in the independent active-query value '
-                             'Q_i = novelty * softened_density * aug_consistency * '
-                             '(lambda * expert_disagreement + (1-lambda) * pred_uncertainty). '
-                             'Computed independently of the OT query/reject columns, since '
-                             '"unfit for pseudo-labeling" (e.g. low density) is not the same '
-                             'as "worth querying" (could be a tail/not-yet-clustered novel '
-                             'class). See route_finalize_scores() for how this is gated by '
-                             'H_i = 1 - pseudo_prob (deferred mass) at query time.')
-    parser.add_argument('--query_density_floor', type=float, default=0.3,
-                        help='Lower bound eta for active-query density gate '
-                             "R'=eta+(1-eta)R. Prevents low-density tail/unformed novel "
-                             'samples from receiving zero query value. Clamped to [0,1].')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume_round0', type=str, default=None)
     parser.add_argument('--egdb_feat_w', type=float, default=0.2,
@@ -1558,9 +1018,6 @@ if __name__ == '__main__':
     # QA-P²OT 参数
     parser.add_argument('--ot_eps', type=float, default=0.05,
                         help='QA-P2OT Sinkhorn 温度（越小分配越硬）')
-    parser.add_argument('--ot_n_iter', type=int, default=100,
-                        help='Sinkhorn maximum iterations. Low eps may need >=100 '
-                             'to satisfy the requested pseudo/deferred column mass.')
     parser.add_argument('--ot_rho_novel', type=float, default=0.85,
                         help='新类虚拟簇过滤比例（1.0=不过滤，0.7=过滤30%%低置信）')
     parser.add_argument('--ot_ema_decay', type=float, default=0.999,
@@ -1573,34 +1030,6 @@ if __name__ == '__main__':
                         help='class-wise expert disagreement 加到真实类代价的权重')
     parser.add_argument('--ot_lambda_u', type=float, default=0.5,
                         help='样本级专家不确定性降低虚拟簇代价的权重')
-    parser.add_argument('--ot_lambda_query', type=float, default=1.0,
-                        help='AL-P2OT query branch cost weight.')
-    parser.add_argument('--ot_lambda_reject', type=float, default=1.0,
-                        help='AL-P2OT reject branch cost weight.')
-    parser.add_argument('--ot_rho_query', type=float, default=0.05,
-                        help='AL-P2OT query branch transport budget.')
-    parser.add_argument('--use_al_p2ot', action='store_true', default=True,
-                        help='Enable Active-Learning-oriented P2OT extensions.')
-    parser.add_argument('--no_al_p2ot', dest='use_al_p2ot',
-                        action='store_false', help='Disable AL-P2OT extensions.')
-    parser.add_argument('--use_three_way_transport', action='store_true', default=False,
-                        help='Opt in to legacy [pseudo-label, query, reject] transport. '
-                             'Default is two-way [pseudo-label, deferred/virtual] transport.')
-    parser.add_argument('--no_three_way_transport', dest='use_three_way_transport',
-                        action='store_false', help='Use default two-way '
-                             '[pseudo-label, deferred/virtual] transport.')
-    parser.add_argument('--use_classwise_disagreement', action='store_true', default=True,
-                        help='Add class-wise expert disagreement to pseudo-label costs.')
-    parser.add_argument('--no_classwise_disagreement', dest='use_classwise_disagreement',
-                        action='store_false', help='Disable class-wise expert disagreement in OT costs.')
-    parser.add_argument('--use_density_score', action='store_true', default=True,
-                        help='Use batch-local kNN density in query/reject values.')
-    parser.add_argument('--no_density_score', dest='use_density_score',
-                        action='store_false', help='Fallback density score R_i=1.')
-    parser.add_argument('--use_aug_consistency', action='store_true', default=True,
-                        help='Use two-view JS consistency in query/reject values.')
-    parser.add_argument('--no_aug_consistency', dest='use_aug_consistency',
-                        action='store_false', help='Fallback augmentation consistency A_i=1.')
     parser.add_argument('--ot_use_reliability_weight', action='store_true', default=True,
                         help='使用虚拟簇真实质量作为 cluster loss 的样本可靠性权重')
     parser.add_argument('--ot_no_reliability_weight', dest='ot_use_reliability_weight',
@@ -1620,6 +1049,6 @@ if __name__ == '__main__':
     parser.add_argument('--ot_rho_gamma', type=float, default=0.7,
                         help='专家一致性修正的保底系数')
 
-    args = parser.parse_args(_normalize_argv(sys.argv[1:]))
+    args = parser.parse_args()
     set_seeding(args.seed)
     train_agcd(args)

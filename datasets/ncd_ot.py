@@ -52,16 +52,7 @@ import torch.nn.functional as F
 import numpy as np
 
 
-def _compute_annotation_prior(active_dataset, all_targets, num_known, num_novel, alpha=1.0, device='cpu',
-                               dynamic_alignment=None):
-    """
-    Args:
-        dynamic_alignment: optional {true_label -> model_head_idx} Hungarian mapping
-            (see get_dynamic_label_mapping in ncd_train_agcd.py). Supervised CE/SupCon
-            losses train head dynamic_alignment[true_label], so the OT prior must be
-            counted in the same head-index coordinate system, not raw true-label ids,
-            or a permuted novel head gets credited with another head's annotations.
-    """
+def _compute_annotation_prior(active_dataset, all_targets, num_known, num_novel, alpha=1.0, device='cpu'):
     K = num_known + num_novel
     label_counts = torch.zeros(K, device=device)
 
@@ -69,9 +60,8 @@ def _compute_annotation_prior(active_dataset, all_targets, num_known, num_novel,
 
     for idx in labeled_indices:
         mapped = int(all_targets[idx])
-        head_idx = dynamic_alignment.get(mapped, mapped) if dynamic_alignment is not None else mapped
-        if 0 <= head_idx < K:
-            label_counts[head_idx] += 1.0
+        if 0 <= mapped < K:
+            label_counts[mapped] += 1.0
 
     novel_labeled = label_counts[num_known:].sum().item()
     if novel_labeled == 0:
@@ -124,67 +114,6 @@ def _norm01(x, eps=1e-8):
     x_min = x.min()
     x_max = x.max()
     return (x - x_min) / (x_max - x_min + eps)
-
-
-def _norm01_or_one(x, eps=1e-8):
-    x_min = x.min()
-    x_max = x.max()
-    if torch.abs(x_max - x_min) < eps:
-        return torch.ones_like(x)
-    return (x - x_min) / (x_max - x_min + eps)
-
-
-def compute_density_score(features, k=10, paired_views=False):
-    """Batch-local kNN density. Fallback is all ones for invalid inputs.
-
-    Args:
-        paired_views: if True and features stacks two augmented views as
-            [view1(B), view2(B)] (row i and row i+B are the same underlying
-            sample), also mask out each sample's other view as a kNN
-            candidate, not just the diagonal self-distance. Must be set
-            explicitly by the caller — this function does not assume the
-            paired-view layout on its own.
-    """
-    if features is None or not torch.is_tensor(features) or features.dim() != 2:
-        device = features.device if torch.is_tensor(features) else torch.device('cpu')
-        size = features.size(0) if torch.is_tensor(features) and features.dim() > 0 else 1
-        return torch.ones(size, device=device)
-    B = features.size(0)
-    if B <= 2:
-        return torch.ones(B, device=features.device)
-    z = F.normalize(features.detach(), dim=1, eps=1e-8)
-    dist = torch.cdist(z, z, p=2)
-    dist.fill_diagonal_(float('inf'))
-    if paired_views and B % 2 == 0:
-        half = B // 2
-        pair_idx = torch.arange(half, device=dist.device)
-        dist[pair_idx, pair_idx + half] = float('inf')
-        dist[pair_idx + half, pair_idx] = float('inf')
-    k_eff = min(max(1, int(k)), B - 1)
-    knn_dist = dist.topk(k_eff, largest=False, dim=1).values.mean(dim=1)
-    density = 1.0 / (knn_dist + 1e-8)
-    return torch.nan_to_num(density, nan=1.0, posinf=1.0, neginf=1.0)
-
-
-def compute_aug_consistency(logits, temp=1.0):
-    """Return [2B] consistency from two-view logits, fallback ones."""
-    if logits is None or not torch.is_tensor(logits) or logits.dim() != 2:
-        device = logits.device if torch.is_tensor(logits) else torch.device('cpu')
-        size = logits.size(0) if torch.is_tensor(logits) and logits.dim() > 0 else 1
-        return torch.ones(size, device=device)
-    B2 = logits.size(0)
-    if B2 % 2 != 0 or B2 < 2:
-        return torch.ones(B2, device=logits.device)
-    B = B2 // 2
-    p1 = F.softmax(logits[:B] / max(temp, 1e-6), dim=1)
-    p2 = F.softmax(logits[B:] / max(temp, 1e-6), dim=1)
-    m = 0.5 * (p1 + p2)
-    js = 0.5 * (
-        (p1 * (p1.clamp_min(1e-8) / m.clamp_min(1e-8)).log()).sum(dim=1) +
-        (p2 * (p2.clamp_min(1e-8) / m.clamp_min(1e-8)).log()).sum(dim=1)
-    )
-    consistency = 1.0 - _norm01(js)
-    return torch.cat([consistency, consistency], dim=0)
 
 
 def _as_mbk_expert_logits(expert_logits, batch_size, num_classes):
@@ -312,7 +241,7 @@ class QAP2OTSolver:
                  eps=0.05,
                  rho_known=1.0,
                  rho_novel=0.85,
-                 n_iter=100,
+                 n_iter=30,
                  alpha=1.0,
                  c_virtual=2.0,
                  query_prior_weight=0.6,
@@ -320,21 +249,11 @@ class QAP2OTSolver:
                  ot_temp=1.0,
                  lambda_dis=0.0,
                  lambda_u=0.0,
-                 lambda_query=1.0,
-                 lambda_reject=1.0,
-                 rho_query=0.05,
-                 use_al_p2ot=True,
-                 use_three_way_transport=False,
-                 use_classwise_disagreement=True,
-                 use_density_score=True,
-                 use_aug_consistency=True,
                  use_adaptive_rho=False,
                  rho_min=0.2,
                  rho_max=0.95,
                  rho_beta=0.1,
                  rho_gamma=0.7,
-                 query_active_lambda=0.5,
-                 query_density_floor=0.3,
                  novel_only_unlabeled=True):
         """
         Args:
@@ -344,8 +263,7 @@ class QAP2OTSolver:
             eps (float):       Sinkhorn 熵正则化（0.05 在 CIFAR-10 上有良好平衡）
             rho_known (float): 已知类的传输质量比例（1.0 = 不过滤）
             rho_novel (float): 新类的传输质量比例（0.85 = 过滤 15% 低置信）
-            n_iter (int):      Sinkhorn 最大迭代次数。低 eps 下 30 次可能使列边际
-                明显偏离目标质量，默认 100 以稳定两路 deferred 容量。
+            n_iter (int):      Sinkhorn 迭代次数（30 次足够 CIFAR-10 收敛）
             alpha (float):     先验 Laplace 平滑（防止新类先验为 0）
             c_virtual (float): 虚拟簇代价（越大 = 越少样本被过滤）
             query_prior_weight (float): 查询分布最大混合权重；会随 round 逐步升高
@@ -353,11 +271,6 @@ class QAP2OTSolver:
             ot_temp (float):     teacher/expert logits 转概率时的 temperature
             lambda_dis (float):  class-wise expert disagreement 的真实类代价权重
             lambda_u (float):    样本不确定性降低虚拟簇代价的权重
-            query_active_lambda (float): 独立主动查询价值 Q_i 中 D_i（专家分歧）
-                和 U_i（融合预测不确定性）的混合权重。
-            query_density_floor (float): 查询价值中密度门控的下限。使用
-                R'_i=floor+(1-floor)R_i，避免尚未成簇/长尾新类因批内低密度
-                被直接乘到零。取值范围 [0, 1]。
         """
         self.num_known = num_known
         self.num_novel = num_novel
@@ -374,16 +287,6 @@ class QAP2OTSolver:
         self.ot_temp = ot_temp
         self.lambda_dis = lambda_dis
         self.lambda_u = lambda_u
-        self.lambda_query = lambda_query
-        self.lambda_reject = lambda_reject
-        self.rho_query = rho_query
-        self.query_active_lambda = min(1.0, max(0.0, float(query_active_lambda)))
-        self.query_density_floor = min(1.0, max(0.0, float(query_density_floor)))
-        self.use_al_p2ot = use_al_p2ot
-        self.use_three_way_transport = use_three_way_transport
-        self.use_classwise_disagreement = use_classwise_disagreement
-        self.use_density_score = use_density_score
-        self.use_aug_consistency = use_aug_consistency
         self.use_adaptive_rho = use_adaptive_rho
         self.rho_min = rho_min
         self.rho_max = rho_max
@@ -397,10 +300,7 @@ class QAP2OTSolver:
     def get_targets(self, student_logits, teacher_model, u_inputs,
                     active_dataset, all_targets, device, round_idx=0,
                     epoch=0, max_epoch=1, expert_logits=None,
-                    student_features=None, dynamic_alignment=None,
-                    rho_novel_override=None,
-                    return_reliability=False, return_stats=False,
-                    return_routing=False):
+                    return_reliability=False, return_stats=False):
         """
         生成 OT 软伪标签目标。
 
@@ -415,26 +315,9 @@ class QAP2OTSolver:
             active_dataset: ActiveDataset 实例（用于计算先验）
             device:         torch.device
             round_idx (int): 当前主动学习轮次（Round 0 不用过滤新类）
-            dynamic_alignment: 可选的 {真实标签 -> 模型输出头} Hungarian 映射
-                （ncd_train_agcd.py 的 get_dynamic_label_mapping）。监督损失用它
-                remap 真实标签到输出头坐标，OT 先验必须用同一套坐标统计标注数量，
-                否则新类簇发生排列置换后，标注先验会被记到错误的传输列上。
-            rho_novel_override: 可选，显式覆盖新类 rho（跳过 round_idx==0 强制
-                rho=1.0、以及 use_adaptive_rho 的动态调度）。仅供 Round 0 的
-                "query_pass" 路由打分复用：训练用的伪标签/可靠性权重必须仍然用
-                round_idx==0 的满质量传输，不能被这个覆盖值污染——调用方应该
-                把这次调用的返回值只用于路由打分，不要用于 loss。
-            return_routing: True 时额外返回逐样本路由概率/价值字典，供轮次级
-                查询策略消费（见下方 Returns）。
 
         Returns:
             ot_targets: [2B, K] 软伪标签，dtype=float32，每行和为 1
-            若 return_routing=True，额外返回一个 dict（张量均已 detach）：
-                pseudo_prob: [2B] 真实类别传输质量 / p，即行归一化前的可靠性
-                query_prob:  [2B] query 节点传输质量 / p
-                reject_prob: [2B] reject 节点传输质量 / p
-                query_value: [2B] D·R·A 查询价值（不依赖 Sinkhorn 质量分配）
-                reject_value:[2B] D·(1-R·A) 拒绝价值
         """
         teacher_model.eval()
 
@@ -449,8 +332,7 @@ class QAP2OTSolver:
         # ── 2. 标注感知先验 ─────────────────────────────────────────
         q_real, novel_labeled = _compute_annotation_prior(
             active_dataset, all_targets, self.num_known, self.num_novel,
-            alpha=self.alpha, device=device,
-            dynamic_alignment=dynamic_alignment)  # [K]
+            alpha=self.alpha, device=device)  # [K]
 
         # All known-class training samples are labeled at initialization in
         # this AGCD protocol, so the unlabeled loader contains novel classes.
@@ -489,13 +371,7 @@ class QAP2OTSolver:
         # Round 1+：新类开始有标注，允许过滤低置信度新类样本
         expert_logits_mbk = _as_mbk_expert_logits(expert_logits, B_2, K)
         rho_stats = {}
-        if rho_novel_override is not None:
-            # Explicit override for a routing-only call (see rho_novel_override
-            # docstring above) — bypasses both the round_idx==0 "no filtering"
-            # invariant and use_adaptive_rho, since this call's outputs are not
-            # used as the actual training pseudo-labels/reliability.
-            rho_novel_eff = torch.tensor(float(rho_novel_override), device=device)
-        elif self.use_adaptive_rho and round_idx > 0:
+        if self.use_adaptive_rho and round_idx > 0:
             self.rho_current = self.rho_current.to(device)
             rho_new, rho_stats = update_adaptive_rho(
                 epoch=epoch,
@@ -541,107 +417,22 @@ class QAP2OTSolver:
         )
         D_class = D_class.to(device)
         U = U.to(device)
-        if self.use_classwise_disagreement and self.lambda_dis > 0:
+        if self.lambda_dis > 0:
             C_real = C_real + self.lambda_dis * D_class
-
-        if self.use_density_score:
-            # student_features stacks the two augmented views as [view1(B), view2(B)]
-            # (see u_inputs = cat([u_view1, u_view2]) in ncd_train_agcd.py), so each
-            # sample's other view must be excluded as a kNN candidate too, or its
-            # near-zero cross-view distance spuriously inflates the density score.
-            density = compute_density_score(student_features, k=10, paired_views=True).to(device)
-            if density.numel() != B_2:
-                density = torch.ones(B_2, device=device)
-        else:
-            density = torch.ones(B_2, device=device)
-        if self.use_aug_consistency:
-            aug_consistency = compute_aug_consistency(teacher_logits, temp=self.ot_temp).to(device)
-        else:
-            aug_consistency = torch.ones(B_2, device=device)
-
-        D_norm = _norm01(U)
-        R_norm = _norm01_or_one(density)
-        A_norm = aug_consistency.clamp(0.0, 1.0)
-        query_value = D_norm * R_norm * A_norm
-        reject_value = D_norm * (1.0 - R_norm * A_norm)
-
-        # ── Independent active-query value Q_i ──────────────────────────
-        # "Not fit for pseudo-labeling" (low real-class transport mass) is
-        # not the same question as "worth spending a label on": a low-density
-        # sample here is just as likely a tail/not-yet-clustered novel class
-        # as it is noise, so query_value/reject_value above (which treat low
-        # density as reject-worthy) should not drive query decisions on their
-        # own. Q_i is computed independently of the query/reject OT columns:
-        # novelty vs. the known-class heads * softened local density support *
-        # augmentation consistency * (expert disagreement mixed with the
-        # fused prediction's own entropy). See route_finalize_scores() in
-        # ncd_train_agcd.py, which gates this by H_i = 1 - pseudo_prob
-        # (deferred mass) instead of folding it into the OT cost matrix.
-        full_probs = log_p_teacher.exp()
-        if self.novel_only_unlabeled:
-            # The current AGCD protocol labels every known-class training sample
-            # initially, so every remaining pool item is novel by construction.
-            # Re-estimating novelty from the model would circularly suppress the
-            # exact novel samples that are still (incorrectly) predicted as known.
-            novelty = torch.ones(B_2, device=device)
-        elif self.num_novel > 0:
-            # For a genuinely mixed pool, compare known-vs-novel probability
-            # mass under ONE full softmax. Never softmax the known slice alone:
-            # that only measures concentration among known classes and is not a
-            # novelty probability.
-            novelty = full_probs[:, self.num_known:].sum(dim=1).clamp(0.0, 1.0)
-        else:
-            novelty = torch.zeros(B_2, device=device)
-        pred_entropy = -(full_probs * torch.log(full_probs.clamp_min(1e-8))).sum(dim=1)
-        uncertainty = _norm01(pred_entropy)
-        lam = self.query_active_lambda
-        density_gate = self.query_density_floor + (1.0 - self.query_density_floor) * R_norm
-        query_active_value = (
-            novelty * density_gate * A_norm
-            * (lam * D_norm + (1.0 - lam) * uncertainty)
-        )
-
-        if self.use_al_p2ot and self.use_three_way_transport:
-            # Reuse q_real_weighted / virtual_mass from step 3: they already
-            # respect the per-class rho_known/rho_novel_eff split (including
-            # the round_idx==0 "no filtering" override), so query/reject only
-            # ever draw from the mass that step 3 decided to withhold from
-            # real classes, instead of re-filtering everything with a single
-            # scalar rho that ignored round_idx and known/novel differences.
-            rho_q = torch.tensor(float(self.rho_query), device=device).clamp_min(0.0)
-            avail_mass = virtual_mass.clamp_min(0.0)
-            rho_q = torch.minimum(rho_q, avail_mass).clamp_min(1e-6)
-            rho_reject = (avail_mass - rho_q).clamp_min(1e-6)
-
-            q_pl = q_real_weighted
-            C_query = -self.lambda_query * query_value.unsqueeze(1)
-            C_reject = -self.lambda_reject * reject_value.unsqueeze(1)
-            q_hat = torch.cat([q_pl, rho_q.view(1), rho_reject.view(1)])
-            q_hat = q_hat / q_hat.sum().clamp_min(1e-8)
-            C_hat = torch.cat([C_real, C_query, C_reject], dim=1)  # [2B, K+2]
-        else:
-            C_virtual = self.c_virtual - self.lambda_u * U.unsqueeze(1)
-            C_virtual = C_virtual.clamp_min(1e-6)
-            C_hat = torch.cat([C_real, C_virtual], dim=1)  # [2B, K+1]
+        C_virtual = self.c_virtual - self.lambda_u * U.unsqueeze(1)
+        C_virtual = C_virtual.clamp_min(1e-6)
+        C_hat = torch.cat([C_real, C_virtual], dim=1)  # [2B, K+1]
         C_hat = torch.nan_to_num(C_hat, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # ── 5. Sinkhorn ──────────────────────────────────────────────
         p = torch.ones(B_2, device=device) / B_2  # 均匀样本权重
         T_hat = _sinkhorn_log(C_hat, p, q_hat, self.eps, self.n_iter)
-        # T_hat: [2B, K+1] or [2B, K+2]
+        # T_hat: [2B, K+1]
 
         # ── 6. 从传输矩阵提取软标签 ─────────────────────────────────
         T_real = T_hat[:, :K]                      # [2B, K]，忽略虚拟簇列
-        if self.use_al_p2ot and self.use_three_way_transport:
-            T_query = T_hat[:, K]
-            T_reject = T_hat[:, K + 1]
-            T_virtual = T_reject
-        else:
-            T_query = torch.zeros(B_2, device=device)
-            T_reject = T_hat[:, K]
-            T_virtual = T_reject
+        T_virtual = T_hat[:, K]                    # [2B]
         real_mass = T_real.sum(dim=1)              # [2B]
-        defer_mass = (p - real_mass).clamp_min(0.0)
 
         # 行归一化 → 只在真实类别内归一化为 soft target
         soft_targets = T_real / real_mass.unsqueeze(1).clamp_min(1e-8)
@@ -651,71 +442,28 @@ class QAP2OTSolver:
 
         self.last_stats = {
             'rho_current': float(rho_novel_eff.detach().item()),
-            'rho_pl': float(T_real.sum().detach().item()),
-            'rho_q': float(T_query.sum().detach().item()),
-            'rho_reject': float(T_reject.sum().detach().item()),
             'rho_time': rho_stats.get('rho_time', float(rho_novel_eff.detach().item())),
             'rho_target': rho_stats.get('rho_target', float(rho_novel_eff.detach().item())),
             'expert_dis': dis_stats['expert_dis'],
             'expert_agreement': dis_stats['expert_agreement'],
             'expert_valid': dis_stats['expert_valid'],
-            'density': density.mean().detach().item(),
-            'aug_consistency': A_norm.mean().detach().item(),
-            'query_value': query_value.mean().detach().item(),
-            'novelty': novelty.mean().detach().item(),
-            'pred_uncertainty': uncertainty.mean().detach().item(),
-            'query_active_value': query_active_value.mean().detach().item(),
-            'query_density_gate': density_gate.mean().detach().item(),
             'real_mass': real_mass.mean().detach().item(),
-            'query_mass': T_query.mean().detach().item(),
-            'reject_mass': T_reject.mean().detach().item(),
             'virtual_mass': T_virtual.mean().detach().item(),
-            'defer_mass': defer_mass.mean().detach().item(),
             'weight_mean': reliability.mean().detach().item(),
             'weight_min': reliability.min().detach().item(),
             'weight_max': reliability.max().detach().item(),
         }
 
-        routing = None
-        if return_routing:
-            routing = {
-                'pseudo_prob': (real_mass / p).detach(),
-                'query_prob': (T_query / p).detach(),
-                'reject_prob': (T_reject / p).detach(),
-                # Mode-independent hold/defer probability. In two-way mode this
-                # is the virtual-column probability; in three-way mode it is the
-                # sum of query and reject probabilities.
-                'defer_prob': (defer_mass / p).clamp(0.0, 1.0).detach(),
-                'query_value': query_value.detach(),
-                'reject_value': reject_value.detach(),
-                # max_k(y_ik): confidence of the OT soft pseudo-label itself,
-                # used by the stable-anchor query score (see
-                # ncd_train_agcd.route_finalize_scores / TransportRouteSampling).
-                'max_soft_target': soft_targets.max(dim=1).values.detach(),
-                # Independent active-query value (see the comment above
-                # query_active_value) — NOT derived from the query/reject OT
-                # columns, deliberately decoupled from "fit for pseudo-label".
-                'novelty': novelty.detach(),
-                'query_active_value': query_active_value.detach(),
-            }
-
         if return_stats:
-            if return_routing:
-                return (soft_targets.float().detach(), reliability.float().detach(),
-                        dict(self.last_stats), routing)
             return soft_targets.float().detach(), reliability.float().detach(), dict(self.last_stats)
 
         if return_reliability:
-            if return_routing:
-                return soft_targets.float().detach(), reliability.float().detach(), routing
             return soft_targets.float().detach(), reliability.float().detach()
 
         # Backward-compatible fallback: callers that do not consume reliability
         # still receive softened labels instead of hard noisy targets.
         uniform = torch.ones_like(soft_targets) / K
         soft_targets = reliability.unsqueeze(1) * soft_targets + (1 - reliability.unsqueeze(1)) * uniform
-        if return_routing:
-            return soft_targets.float(), routing
         return soft_targets.float()
 
 
